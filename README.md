@@ -10,7 +10,6 @@ A Python pipeline that converts raw Apple HealthKit exports (CSV and XML) into a
 
 ## Table of Contents
 
-- [Features](#features)
 - [Tech Stack](#tech-stack)
 - [Installation](#installation)
 - [Stage 1 — Loading](#stage-1--loading)
