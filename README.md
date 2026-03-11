@@ -1,5 +1,7 @@
 # HealthKit Preprocessing Pipeline
 
+**Credits:** Scripts in this repository were developed primarily by **Dawson Haddox** (Clinical Psychology Ph.D. Student, Personalized Treatment Lab, University of Arizona), drawing inspiration from prior work by **Samir Akre**. The experimental HRV features were designed and implemented primarily by **Agrim Sachdeva**.
+
 ## Overview
 
 A Python pipeline that converts raw Apple HealthKit exports (CSV and XML) into analysis-ready, wide-format feature matrices. The pipeline follows a three-stage architecture: **load**, **clean**, **aggregate**. It is fully configurable through dataclass-based configuration objects, so researchers can customize feature plausibility thresholds, aggregation windowing, and output aggregated features without modifying core code. Optional post-aggregation branches provide quality control masking, hierarchical aggregation (e.g., hourly to daily), and dedicated sleep feature extraction.
