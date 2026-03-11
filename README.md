@@ -647,9 +647,15 @@ daily = layers["daily"]
 
 # ── 6. Daily sleep features ──────────────────────────────────
 sleep = aggregator.compute_daily_sleep_features(clean_df, qc=True)
-sleep = aggregator.apply_sleep_quality_control(sleep)
 
-# ── 7. Export ─────────────────────────────────────────────────
+# ── 7. Merge sleep into daily ─────────────────────────────────
+daily = daily.merge(
+    sleep.rename(columns={"date": "local_date"}),
+    on=["user_id", "local_date"],
+    how="left",
+)
+
+# ── 8. Export ─────────────────────────────────────────────────
 daily.to_csv("features_daily.csv", index=False)
 print(f"Exported {len(daily)} daily feature rows")
 ```
