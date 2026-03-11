@@ -1,6 +1,6 @@
 # HealthKit Preprocessing Pipeline
 
-**Credits:** Scripts in this repository were developed by **Dawson Haddox** (Clinical Psychology Ph.D. Student, Personalized Treatment Lab, University of Arizona), drawing inspiration from prior work by **Samir Akre**. The experimental HRV features were designed and implemented primarily by **Agrim Sachdeva**.
+**Credits:** Scripts in this repository were developed by **Dawson Haddox** (Clinical Psychology Ph.D. Student, Personalized Treatment Lab, University of Arizona), drawing inspiration from prior work by **Dr. Samir Akre**. The experimental HRV features were designed and implemented primarily by **Dr. Agrim Sachdeva** (Assistant Professor, Management Information Systems, University of Arizona).
 
 ## Overview
 
