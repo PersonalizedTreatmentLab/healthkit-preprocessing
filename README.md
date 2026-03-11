@@ -2,7 +2,7 @@
 
 ## Overview
 
-A research-grade Python pipeline that converts raw Apple HealthKit exports (CSV and XML) into analysis-ready, wide-format feature matrices. The pipeline follows a three-stage architecture: **load**, **clean**, **aggregate**. It is fully configurable through dataclass-based configuration objects, so researchers can customize feature plausibility thresholds, aggregation windowing, and output aggregated features without modifying core code. Optional post-aggregation branches provide quality control masking, hierarchical aggregation (e.g., hourly to daily), and dedicated sleep feature extraction.
+A Python pipeline that converts raw Apple HealthKit exports (CSV and XML) into analysis-ready, wide-format feature matrices. The pipeline follows a three-stage architecture: **load**, **clean**, **aggregate**. It is fully configurable through dataclass-based configuration objects, so researchers can customize feature plausibility thresholds, aggregation windowing, and output aggregated features without modifying core code. Optional post-aggregation branches provide quality control masking, hierarchical aggregation (e.g., hourly to daily), and dedicated sleep feature extraction.
 
 ---
 
