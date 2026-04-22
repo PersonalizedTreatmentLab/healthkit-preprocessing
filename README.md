@@ -12,6 +12,7 @@ A Python pipeline that converts raw Apple HealthKit CSV exports into analysis-re
 
 - [Tech Stack](#tech-stack)
 - [Installation](#installation)
+- [HealthKit Datastreams Supported by Default](#healthkit-datastreams-supported-by-default)
 - [Stage 1 — Loading](#stage-1--loading)
 - [Stage 2 — Cleaning](#stage-2--cleaning)
 - [Stage 3 — Aggregation](#stage-3--aggregation)
@@ -44,6 +45,45 @@ pip install -r requirements.txt
 ```
 
 > **Note:** `scipy` is only required if you enable frequency-domain HRV features (`compute_hrv=True` and `hrv_freq_domain=True` in `HKAggConfig`). The pipeline runs without it, and these features aren't typically recommended by default due to data limitations.
+
+
+---
+
+## HealthKit Datastreams Supported by Default
+
+The pipeline recognizes the following Apple HealthKit types out-of-the-box. Each type is routed through a cleaning handler (Stage 2) and an aggregation profile (Stage 3) that depend on its **time behavior**. Types not listed here still pass through loading and a minimal cleaning path. For more elaborate cleaning and aggregation, new types must be configured in appropriate registries.
+
+| Type | Time behavior | Stage 2 handler | Device class | Default aggregates (Stage 3) |
+|---|---|---|---|---|
+| `StepCount` | interval_total | activity | either | `sum`, `duration`, `rate_per_min` |
+| `DistanceWalkingRunning` | interval_total | activity | either | `sum`, `duration`, `rate_per_min` |
+| `DistanceCycling` | interval_total | activity | either | `sum`, `duration`, `rate_per_min` |
+| `FlightsClimbed` | interval_total | activity | either | `sum`, `duration`, `rate_per_min` |
+| `ActiveEnergyBurned` | interval_total | activity | either | `sum`, `duration`, `rate_per_min` |
+| `BasalEnergyBurned` | interval_total | activity | either | `sum`, `duration`, `rate_per_min` |
+| `AppleExerciseTime` | interval_total | activity | either | `sum` |
+| `AppleStandTime` | interval_total | activity | either | `sum` |
+| `EnvironmentalAudioExposure` | interval_level | audio | either | `leq`, `energy_seconds`, `time_weighted_mean`, `max`, `duration`, `median`, `median_duration`, `count`, `p95`, `time_above_85` |
+| `HeadphoneAudioExposure` | interval_level | audio | non_watch_exclusive | `leq`, `energy_seconds`, `time_weighted_mean`, `max`, `duration`, `median`, `median_duration`, `count`, `p95`, `time_above_85` |
+| `HeartRate` | point | vitals | watch_exclusive | `mean`, `median`, `std`, `max`, `min`, `count` (also drives wear detection and optional HRV) |
+| `HeartRateVariabilitySDNN` | point | vitals | watch_exclusive | `mean`, `median`, `std`, `max`, `min`, `count`, `p75` |
+| `RespiratoryRate` | point | vitals | watch_exclusive | `mean`, `median`, `std`, `max`, `min`, `count` |
+| `OxygenSaturation` | point | vitals | watch_exclusive | `mean`, `median`, `std`, `max`, `min`, `count`, `pct_below_92` |
+| `SleepAnalysis` | categorical_interval | cat | either | per-label `sum`, `mean`, `count`, `start`, `end` for `in_bed`, `asleep`, `awake`, `sleep_unknown` |
+| `EnvironmentalAudioExposureEvent` | categorical_interval | cat | either | `sum`, `mean`, `count` for the `momentary_limit` label |
+
+**Time-behavior categories, at a glance:**
+
+- **interval_total** — cumulative counts/totals over an interval (e.g., steps in a 10-minute window). Values are split proportionally across window boundaries when intervals straddle them.
+- **interval_level** — a sustained level maintained over an interval (e.g., ambient dB). Aggregation is time-weighted.
+- **point** — an instantaneous sample at one moment (e.g., a single heart-rate reading). Observations are assigned to whichever window contains the sample timestamp.
+- **categorical_interval** — a labeled interval (e.g., a sleep stage). Per-label durations, counts, and boundary timestamps are tracked.
+
+**Device-class meanings:**
+
+- `watch_exclusive` — only Apple Watch sources are considered valid.
+- `non_watch_exclusive` — watch sources are excluded (e.g., headphone audio, which is a phone/headphone signal).
+- `either` — watch and non-watch sources both count.
 
 ---
 
