@@ -60,7 +60,7 @@ class HKCleanConfig:
         "FlightsClimbed": {"min": 0},
 
         # Vitals
-        "HeartRate": {"min": 30, "max": 200},                  # bpm
+        "HeartRate": {"min": 30, "max": 230},                  # bpm
         "HeartRateVariabilitySDNN": {"min": 0, "max": 1},      # seconds
         "RespiratoryRate": {"min": 0.1, "max": 100},              # breaths/min
         "OxygenSaturation": {"min": 0.50, "max": 1.0},         # fraction

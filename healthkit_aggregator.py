@@ -2521,8 +2521,8 @@ class HealthKitAggregator:
             d.loc[d["sleep_efficiency_day"] > 1, "sleep_efficiency_day"] = 1.0
 
         # durations (set 0 to nan)
-        if "sleep_duration_day" in d.columns:
-            d.loc[d["sleep_duration_day"] == 0, "sleep_duration_day"] = np.nan
+        if "sleep_sleep_duration_day" in d.columns:
+            d.loc[d["sleep_sleep_duration_day"] == 0, "sleep_sleep_duration_day"] = np.nan
 
         if "sleep_bedrest_duration_day" in d.columns:
             d.loc[d["sleep_bedrest_duration_day"] == 0, "sleep_bedrest_duration_day"] = np.nan
@@ -2530,5 +2530,28 @@ class HealthKitAggregator:
         # stage sums (hours; set > 20 to nan)
         if "sleep_Awake_sum_day" in d.columns:
             d.loc[d["sleep_Awake_sum_day"] > 20, "sleep_Awake_sum_day"] = np.nan
+
+        if self.cfg.apply_sleep_qc_fill_nan and "sleep_sleep_duration_day" in d.columns:
+            fill_in_sleep_index = d.loc[d["sleep_sleep_duration_day"].notna()].index
+            sleep_cat_cols = [
+                "sleep_Asleep_count_day",
+                "sleep_Asleep_mean_day",
+                "sleep_Asleep_sum_day",
+                "sleep_Awake_count_day",
+                "sleep_Awake_mean_day",
+                "sleep_Awake_sum_day",
+                "sleep_InBed_count_day",
+                "sleep_InBed_mean_day",
+                "sleep_InBed_sum_day",
+                "sleep_CategoryValueUnknown_count_day",
+                "sleep_CategoryValueUnknown_mean_day",
+                "sleep_CategoryValueUnknown_sum_day",
+            ]
+            sleep_cat_cols = [c for c in sleep_cat_cols if c in d.columns]
+            if sleep_cat_cols:
+                d[sleep_cat_cols] = d[sleep_cat_cols].astype(float)
+                d.loc[fill_in_sleep_index, sleep_cat_cols] = d.loc[
+                    fill_in_sleep_index, sleep_cat_cols
+                ].fillna(0.0)
 
         return d

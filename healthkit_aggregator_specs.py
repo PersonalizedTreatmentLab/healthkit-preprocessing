@@ -316,6 +316,7 @@ class HKAggConfig:
     # --- Zero Fill ---
     # If True, fill missing-but-expected observations with zeros when the zero_fill_gate condition is met.
     apply_zero_fill: bool = False
+    apply_sleep_qc_fill_nan: bool = False        # Fill missing daily sleep stage/category aggregates with zeros when sleep duration is present
 
     # --- HRV ---
     # If True, compute additional heart rate variability features from HeartRate data.

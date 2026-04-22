@@ -2,22 +2,19 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import logging
-import re
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Optional, Sequence, Tuple, Union
-import xml.etree.ElementTree as ET
+from typing import Any, Dict, Iterable, Optional, Sequence, Tuple, Union
 from zoneinfo import ZoneInfo
 from tqdm.auto import tqdm
 from healthkit_loader_specs import HKLoadConfig
 
-#* Note. My TZ handling is only applied to CSVs. XML TZ handling is different (think keeps Samir's ideas)
 #* While handling of travel works well, DST fall-back is flawed, often assuming points lie in the second repeat of the hour.
 # ===================================================
 # Class: HealthKitLoader
 # ===================================================
 class HealthKitLoader:
     """
-    Loads HealthKit CSV/XML data and normalizes columns.
+    Loads HealthKit CSV data and normalizes columns.
     """
 
     DST_SAMPLE_LIMIT = 5
@@ -54,13 +51,6 @@ class HealthKitLoader:
                 "ambiguous_infer_fail_rows": 0,
                 "fallback_used": False,
                 "fallback_samples": [],
-            },
-            "xml_timezone": {
-                "rows_inferred_nearest": 0,
-                "rows_inferred_ffill": 0,
-                "rows_inferred_bfill": 0,
-                "rows_defaulted": 0,
-                "rows_invalid_tz_coerced_default": 0,
             },
             "user_id": {
                 "rows_in": 0,
@@ -276,13 +266,11 @@ class HealthKitLoader:
             self,
             path: str | Path,
             *,
-            user_id: str | int | None = None,
             return_report: bool = False,
         ) -> Union[pd.DataFrame, Tuple[pd.DataFrame, Dict[str, Any]]]:
         """
-        Load a single HealthKit file (CSV or XML) and normalize columns.
-        - CSV: assumes data already has required columns.
-        - XML: parses Apple Health export, sets `user_id`, and adds local time via inferred/nearest timezone.
+        Load a single HealthKit CSV file and normalize columns.
+        Assumes data already has required columns.
         Returns a dataframe with expected columns: user_id, local_start, local_end, timezone, type, utc_start, utc_end, value, ...
         If return_report=True, returns (dataframe, report).
         """
@@ -302,11 +290,6 @@ class HealthKitLoader:
             for c in ("local_start", "local_end"):
                 if c in data.columns:
                     data[c] = pd.to_datetime(data[c], errors="coerce")
-        elif suffix == ".xml":
-            self.logger.info("Loading XML data from %s", path)
-            xml_uid = -999 if user_id is None else user_id
-            data = self._load_healthkit_xml(path, user_id=xml_uid)
-            data = self._add_local_time(data, report=report)
         else:
             raise ValueError(f"Unknown file format: {path}")
         report["__global__"]["rows_in_raw"] = int(len(data))
@@ -545,7 +528,7 @@ class HealthKitLoader:
 
         self.logger.info(
             "Loaded file %s type=%s rows_in=%s rows_out=%s dropped=%s tz_filled=%s tz_dropped=%s "
-            "uid_dropped=%s dst_fallback=%s dst_nonexistent_detected=%s xml_defaulted=%s",
+            "uid_dropped=%s dst_fallback=%s dst_nonexistent_detected=%s",
             path,
             report["__global__"]["file_type"],
             report["__global__"]["rows_in_raw"],
@@ -556,7 +539,6 @@ class HealthKitLoader:
             int(report["user_id"]["rows_dropped_non_numeric"]),
             int(report["dst"]["fallback_ambiguous_false_rows"]),
             int(report["dst"]["nonexistent_detected_rows"]),
-            int(report["xml_timezone"]["rows_defaulted"]),
         )
 
         if return_report:
@@ -607,11 +589,11 @@ class HealthKitLoader:
                 participant_report["missing_files"].append(str(fp))
                 continue
             if return_report:
-                loaded, file_report = self.load_file(fp, user_id=user_id, return_report=True)
+                loaded, file_report = self.load_file(fp, return_report=True)
                 hk_data_list.append(loaded)
                 participant_report["files"].append(file_report)
             else:
-                hk_data_list.append(self.load_file(fp, user_id=user_id))
+                hk_data_list.append(self.load_file(fp))
 
         participant_report["__global__"]["files_found"] = int(len(hk_data_list))
         participant_report["__global__"]["files_missing"] = int(len(participant_report["missing_files"]))
@@ -649,16 +631,12 @@ class HealthKitLoader:
         self,
         root: str | Path,
         *,
-        patterns: Sequence[str] = ("**/*.csv", "**/*.xml"),
-        user_id_resolver: Optional[Callable[[Path], str | int]] = None,
-        default_xml_user: str | int = -999,
+        patterns: Sequence[str] = ("**/*.csv",),
         strict: bool = False,
         return_report: bool = False,
     ) -> Union[pd.DataFrame, Tuple[pd.DataFrame, Dict[str, Any]]]:
         """
-        Recursively load many HealthKit files (CSV and/or XML) under `root`.
-        - `user_id_resolver`: function(path) -> user_id used ONLY for XML (CSV is assumed to carry its own user_id column).
-        - `default_xml_user`: fallback user_id for XML when resolver/inference fails.
+        Recursively load many HealthKit CSV files under `root`.
         - `strict=True`: raise on first file error; else log and continue.
         Returns a single concatenated dataframe.
         If return_report=True, returns (dataframe, report).
@@ -666,14 +644,6 @@ class HealthKitLoader:
         root = Path(root).expanduser().resolve()
         if not root.exists():
             raise FileNotFoundError(f"Root not found: {root}")
-
-        def _infer_uid(p: Path) -> str | int | None:
-            """Infer user id by searching for digits in filename and parent directories."""
-            for part in (p.stem, *p.parts[::-1]):
-                m = re.search(r"(\d+)", part)
-                if m:
-                    return int(m.group(1))
-            return None
 
         # Collect files that match any of the provided patterns.
         files = sorted({fp for pat in patterns for fp in root.rglob(pat)})
@@ -694,26 +664,12 @@ class HealthKitLoader:
         frames: list[pd.DataFrame] = []
         for fp in tqdm(files, desc="Loading HealthKit files"):
             try:
-                if fp.suffix.lower() == ".xml":
-                    uid = user_id_resolver(fp) if user_id_resolver else _infer_uid(fp)
-                    file_uid = uid if uid is not None else default_xml_user
-                    if return_report:
-                        loaded, file_report = self.load_file(
-                            fp,
-                            user_id=file_uid,
-                            return_report=True,
-                        )
-                        frames.append(loaded)
-                        bulk_report["files"].append(file_report)
-                    else:
-                        frames.append(self.load_file(fp, user_id=file_uid))
+                if return_report:
+                    loaded, file_report = self.load_file(fp, return_report=True)
+                    frames.append(loaded)
+                    bulk_report["files"].append(file_report)
                 else:
-                    if return_report:
-                        loaded, file_report = self.load_file(fp, return_report=True)
-                        frames.append(loaded)
-                        bulk_report["files"].append(file_report)
-                    else:
-                        frames.append(self.load_file(fp))
+                    frames.append(self.load_file(fp))
             except Exception as e:  # noqa: BLE001
                 if strict:
                     raise
@@ -759,220 +715,3 @@ class HealthKitLoader:
         if return_report:
             return out, bulk_report
         return out
-
-    # ========================
-    # Load/Prep HealthKit XML
-    # ========================
-    def _load_healthkit_xml(self, path: Path, user_id: int | str = -999) -> pd.DataFrame:
-        # Parse XML file + get root node
-        tree = ET.parse(path.as_posix())
-        root = tree.getroot()
-
-        # Flatten each <Record> into a dict, merging <MetadataEntry> key/value pairs
-        record_list = [(lambda d: (d.update({y.attrib.get("key"): y.attrib.get("value") for y in child.iter("MetadataEntry")}) or d))
-            (dict(child.attrib)) for child in tqdm(root.iter("Record"), desc="Parsing HealthKit XML")]
-        data = pd.DataFrame(record_list)
-
-        # Coerce timestamp-like columns to UTC datetimes
-        for col in ("creationDate", "startDate", "endDate"):
-            if col in data.columns:
-                data[col] = pd.to_datetime(data[col], errors="coerce", utc=True)
-
-        # Normalize "type" strings by stripping HK identifier prefixes
-        if "type" in data.columns:
-            data["type"] = data["type"].astype(str)
-            for repl in ("HKQuantityTypeIdentifier", "HKCategoryTypeIdentifier", "HKDataType"):
-                data["type"] = data["type"].str.replace(repl, "", regex=False)
-        
-        # Special-case: SleepAnalysis values (strip category prefix)
-        if "type" in data.columns:
-            mask_sleep = data["type"].eq("SleepAnalysis")
-            if mask_sleep.any() and "value" in data.columns:
-                data.loc[mask_sleep, "value"] = (
-                    data.loc[mask_sleep, "value"].astype(str)
-                    .str.replace("HKCategoryValueSleepAnalysis", "", regex=False))
-        # Set "count" quantity to always be 1
-        data["body.quantity.count"] = 1
-
-        # Extract device.name (best-effort) from the HealthKit "device" string
-        device_series = data.get("device", pd.Series(index=data.index))
-        def _orig_get_device(s):
-            if not isinstance(s, str):
-                return None
-            try:
-                return s.split(", ")[1].replace("name:", "")
-            except Exception:
-                return None
-        data["device.name"] = device_series.apply(_orig_get_device)
-
-        # Attach provided user_id.
-        data["user_id"] = user_id
-        return data
-
-    def _add_local_time(
-        self,
-        hk_data: pd.DataFrame,
-        report: Optional[Dict[str, Any]] = None,
-    ) -> pd.DataFrame:
-        """
-        Add timezone + local_start/local_end to HK XML data.
-        Assumes UTC in startDate/endDate; infers nearest HKTimeZone across days; falls back to default_tz.
-        """
-        default_tz = self.cfg.default_tz
-        hk_data = hk_data.copy()
-        tz_col = "HKTimeZone"
-        xml_rep = self._ensure_report_section(
-            report,
-            "xml_timezone",
-            {
-                "rows_inferred_nearest": 0,
-                "rows_inferred_ffill": 0,
-                "rows_inferred_bfill": 0,
-                "rows_defaulted": 0,
-                "rows_invalid_tz_coerced_default": 0,
-            },
-        )
-
-        # Extract timezone information (or create empty column)
-        if tz_col in hk_data.columns:
-            timezone_data = hk_data[["startDate", "endDate", tz_col]].copy()
-        else:
-            timezone_data = hk_data.assign(HKTimeZone=np.nan)[["startDate", "endDate", tz_col]]
-
-        # Normalize to date granularity
-        timezone_data["date_raw"] = timezone_data["startDate"].dt.date
-
-        # One timezone value per startDate
-        single_tz = (timezone_data.drop_duplicates(subset=["startDate"])[["startDate", tz_col]]
-            .groupby("startDate", as_index=False)[tz_col].first())
-        
-        # Resample to daily frequency
-        if single_tz.empty:
-            resamp_tz = pd.DataFrame(columns=[tz_col], index=pd.DatetimeIndex([], name="startDate"))
-        else:
-            resamp_tz = single_tz.set_index("startDate")[tz_col].resample("1D", origin="start_day").asfreq().to_frame()
-
-        resamp_tz[tz_col] = resamp_tz[tz_col].astype("string").str.strip()
-        resamp_tz.loc[resamp_tz[tz_col].eq(""), tz_col] = pd.NA
-        fill_stage = pd.Series(pd.NA, index=resamp_tz.index, dtype="object")
-        fill_stage.loc[resamp_tz[tz_col].notna()] = "original"
-
-        # Fill missing timezones via nearest + forward/backward fill, tracking stage labels.
-        tz_daily = resamp_tz[tz_col].copy()
-        valid_daily = tz_daily.dropna()
-        if not valid_daily.empty:
-            missing_idx = tz_daily[tz_daily.isna()].index
-            if len(missing_idx) > 0:
-                nearest_pos = valid_daily.index.get_indexer(missing_idx, method="nearest")
-                nearest_values = pd.Series(valid_daily.to_numpy()[nearest_pos], index=missing_idx)
-                tz_daily.loc[missing_idx] = nearest_values
-                fill_stage.loc[missing_idx] = "nearest"
-
-        tz_ffill = tz_daily.ffill()
-        ffill_idx = tz_daily.isna() & tz_ffill.notna()
-        if ffill_idx.any():
-            fill_stage.loc[ffill_idx] = "ffill"
-
-        tz_bfill = tz_ffill.bfill()
-        bfill_idx = tz_ffill.isna() & tz_bfill.notna()
-        if bfill_idx.any():
-            fill_stage.loc[bfill_idx] = "bfill"
-
-        resamp_tz[tz_col] = tz_bfill
-        resamp_tz["_tz_fill_stage"] = fill_stage
-        resamp_tz["date_raw"] = resamp_tz.index.date
-
-        # Attach resolved timezone back to original data
-        hk_data["date_raw"] = hk_data["startDate"].dt.date
-        if tz_col in hk_data.columns:
-            hk_data = hk_data.drop(columns=[tz_col])
-        hk_data = hk_data.merge(resamp_tz[["date_raw", tz_col, "_tz_fill_stage"]], how="left")
-
-        if xml_rep is not None and "_tz_fill_stage" in hk_data.columns:
-            xml_rep["rows_inferred_nearest"] = int(xml_rep["rows_inferred_nearest"]) + int((hk_data["_tz_fill_stage"] == "nearest").sum())
-            xml_rep["rows_inferred_ffill"] = int(xml_rep["rows_inferred_ffill"]) + int((hk_data["_tz_fill_stage"] == "ffill").sum())
-            xml_rep["rows_inferred_bfill"] = int(xml_rep["rows_inferred_bfill"]) + int((hk_data["_tz_fill_stage"] == "bfill").sum())
-
-        tz_series = hk_data[tz_col].astype("string").str.strip()
-        missing_tz_mask = tz_series.isna() | tz_series.eq("")
-        rows_defaulted = int(missing_tz_mask.sum())
-        if rows_defaulted:
-            hk_data.loc[missing_tz_mask, tz_col] = default_tz
-        if xml_rep is not None:
-            xml_rep["rows_defaulted"] = int(xml_rep["rows_defaulted"]) + rows_defaulted
-
-        tz_after_default = hk_data[tz_col].astype("string").str.strip()
-        non_missing_mask = ~(tz_after_default.isna() | tz_after_default.eq(""))
-        invalid_tz_mask = pd.Series(False, index=hk_data.index, dtype=bool)
-        if non_missing_mask.any():
-            invalid_tz_mask.loc[non_missing_mask] = tz_after_default.loc[non_missing_mask].map(
-                lambda z: not self._is_valid_timezone_name(str(z))
-            )
-        invalid_tz_rows = int(invalid_tz_mask.sum())
-        if xml_rep is not None:
-            xml_rep["rows_invalid_tz_coerced_default"] = (
-                int(xml_rep["rows_invalid_tz_coerced_default"]) + invalid_tz_rows
-            )
-
-        hk_data = self._normalize_timezone_column(
-            hk_data,
-            tz_col=tz_col,
-            context="xml:HKTimeZone",
-            report=report,
-            report_key="timezone",
-        )
-
-        if "_tz_fill_stage" in hk_data.columns:
-            hk_data = hk_data.drop(columns=["_tz_fill_stage"])
-
-        if xml_rep is not None and (
-            int(xml_rep["rows_inferred_nearest"])
-            + int(xml_rep["rows_inferred_ffill"])
-            + int(xml_rep["rows_inferred_bfill"])
-            + int(xml_rep["rows_defaulted"])
-            + int(xml_rep["rows_invalid_tz_coerced_default"])
-            > 0
-        ):
-            self.logger.warning(
-                "[xml:HKTimeZone] Timezone inference/defaulting applied: nearest=%s ffill=%s bfill=%s "
-                "defaulted=%s invalid_tz_coerced_default=%s",
-                int(xml_rep["rows_inferred_nearest"]),
-                int(xml_rep["rows_inferred_ffill"]),
-                int(xml_rep["rows_inferred_bfill"]),
-                int(xml_rep["rows_defaulted"]),
-                int(xml_rep["rows_invalid_tz_coerced_default"]),
-            )
-
-        # Per-timezone conversion helper
-        def _tz_convert(group: pd.DataFrame, tz: str) -> pd.DataFrame:
-            group = group.copy()
-
-            # Ensure UTC reference columns
-            if "utc_start" not in group.columns:
-                group["utc_start"] = group["startDate"]
-            if "utc_end" not in group.columns:
-                group["utc_end"] = group["endDate"]
-            group["utc_start"] = pd.to_datetime(group["utc_start"], errors="coerce", utc=True)
-            group["utc_end"] = pd.to_datetime(group["utc_end"], errors="coerce", utc=True)
-            
-            # Convert UTC → local timezone
-            if "local_start_tz" not in group.columns:
-                group["local_start_tz"] = group["utc_start"].dt.tz_convert(tz)
-            if "local_end_tz" not in group.columns:
-                group["local_end_tz"] = group["utc_end"].dt.tz_convert(tz)
-
-            # Drop timezone info for naive local timestamps
-            group["local_start"] = pd.to_datetime(group["local_start_tz"], errors="coerce").dt.tz_localize(None)
-            group["local_end"] = pd.to_datetime(group["local_end_tz"], errors="coerce").dt.tz_localize(None)
-            return group
-
-        # Apply timezone conversion helper
-        tz_parts = []
-        for tz, group in hk_data.groupby(tz_col, sort=False):
-            tz_parts.append(_tz_convert(group, str(tz)))
-        if tz_parts:
-            hk_data = pd.concat(tz_parts, axis=0, sort=False).sort_index()
-
-        # Rename timezone column, return data
-        hk_data = hk_data.rename(columns={tz_col: "timezone"})
-        return hk_data

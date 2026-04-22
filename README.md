@@ -4,7 +4,7 @@
 
 ## Overview
 
-A Python pipeline that converts raw Apple HealthKit exports (CSV and XML) into analysis-ready, wide-format feature matrices. The pipeline follows a three-stage architecture: **load**, **clean**, **aggregate**. It is fully configurable through dataclass-based configuration objects, so researchers can customize feature plausibility thresholds, aggregation windowing, and output aggregated features without modifying core code. Optional post-aggregation branches provide quality control masking, hierarchical aggregation (e.g., hourly to daily), and dedicated sleep feature extraction.
+A Python pipeline that converts raw Apple HealthKit CSV exports into analysis-ready, wide-format feature matrices. The pipeline follows a three-stage architecture: **load**, **clean**, **aggregate**. It is fully configurable through dataclass-based configuration objects, so researchers can customize feature plausibility thresholds, aggregation windowing, and output aggregated features without modifying core code. Optional post-aggregation branches provide quality control masking, hierarchical aggregation (e.g., hourly to daily), and dedicated sleep feature extraction.
 
 ---
 
@@ -51,16 +51,21 @@ pip install -r requirements.txt
 
 ### What it does
 
-The loader reads raw Apple HealthKit export files (CSV or XML), detects the file format automatically, and normalizes the data into a canonical long-form DataFrame. Specifically, it:
+The loader reads raw Apple HealthKit CSV exports and normalizes them into a canonical long-form DataFrame suitable for cleaning and aggregation. A single loader instance carries one `HKLoadConfig` that governs timezone and DST behavior, and exposes three public entry points that share the same per-file processing pipeline.
 
-- Merges variant value columns (`body.quantity.value`, `body.category.value`) into a single `value` column
-- Normalizes HealthKit type labels (strips `HKQuantityTypeIdentifier` prefixes, converts camelCase, cleans up sleep labels)
-- Resolves possible timezone column variants into a single `timezone` column
-- Handles missing timezones according to a configurable policy (fill with a default, drop the row, or raise an error)
-- Resolves DST ambiguities (fall-back: same clock time occurs twice; tries to infer but typically assumes observations belong to the repeated hour rather than the original) and nonexistent times (spring-forward: clock skips ahead)
-- For XML files: parses `<Record>` entries, infers timezone schedules from `HKTimeZone` metadata, and derives local timestamps from UTC
-- Coerces `user_id` to integer-like values and drops rows with invalid IDs
-- Produces both UTC and local timestamps for every observation
+At a high level, each CSV is put through these steps (in order):
+
+1. **Read** the CSV with `pandas.read_csv` (low memory mode off) and parse `local_start` / `local_end` with `pd.to_datetime(errors="coerce")`.
+2. **Merge value columns.** If `body.quantity.value` and/or `body.category.value` are present, they are combined into a single `value` column (category overrides quantity when both are populated).
+3. **Normalize `type` strings.** If any `type` is all-uppercase (e.g., `"HEART_RATE"`), the whole column is converted to CamelCase; `Sdnn` is corrected to `SDNN`; for sleep rows, the `value` column is CamelCased too (e.g., `ASLEEP_CORE` → `AsleepCore`).
+4. **Rename timezone column variants.** `HKTimezone` or `HKTimeZone` → `timezone`.
+5. **Normalize timezone values.** Missing or non-IANA `timezone` entries are handled per `timezone_missing_policy`: filled with `default_tz`, dropped, or raised.
+6. **Localize and compute UTC timestamps.** For each `timezone` group, naive `local_start` / `local_end` are localized into timezone-aware `local_start_tz` / `local_end_tz`, then converted to `utc_start` / `utc_end`. Ambiguous fall-back times and nonexistent spring-forward times are resolved per `dst_ambiguous` / `dst_nonexistent`. If pandas' `ambiguous="infer"` fails on a group, the loader falls back to the second fold (standard time) and records a diagnostic sample. This step is skipped for any timestamp column that already exists on the input.
+7. **Validate schema.** The loader requires `user_id`, `local_start`, `local_end`, `timezone`, `type`, `utc_start`, and `utc_end` to be present (most of which may have been computed in step 6). Missing columns raise `ValueError`.
+8. **Coerce `user_id`.** Non-numeric or non-integer IDs are dropped, and the column is cast to `int64`.
+9. **Derive `device.name_id`.** If a `device.name` column is present and `device.name_id` is not, the loader maps `"Apple Watch" → 2`, `"iPhone" → 1`, all else → `0` (nullable `Int8`).
+
+All other input columns (e.g., `device.name`, `device_source_id`, source metadata) pass through unchanged so they remain available to downstream stages.
 
 ### Scripts
 
@@ -68,26 +73,90 @@ The loader reads raw Apple HealthKit export files (CSV or XML), detects the file
 |------|------|
 | `healthkit_loader.py` | Main loader class (`HealthKitLoader`) with three public entry points |
 | `healthkit_loader_specs.py` | Configuration dataclass (`HKLoadConfig`) controlling timezone and DST behavior |
+| `healthkit_loader_report_analyzer.py` | CLI that aggregates saved loader report JSON files into Markdown summaries |
 
-### How to use
+### Expected input CSV format
+
+Files must be `.csv` — the loader raises `ValueError("Unknown file format")` on any other suffix. The loader is tolerant of a few column-name variants (it renames them into the canonical form during loading), but the following **logical** columns must be resolvable for each file:
+
+| Logical column | Accepted input names | Required? | Notes |
+|---|---|---|---|
+| `user_id` | `user_id` | yes | Must be coercible to an integer; non-numeric rows are dropped |
+| `type` | `type` | yes | HealthKit type label. Accepts CamelCase (`HeartRate`, `StepCount`) or SHOUTY form (`HEART_RATE`); SHOUTY is auto-converted. |
+| `value` | `value`, `body.quantity.value`, `body.category.value` | yes | Numeric for quantity types, string label for category types (e.g., sleep stages). Merged into `value`. |
+| `local_start`, `local_end` | `local_start`, `local_end` | yes | Naive local timestamps (parseable by `pd.to_datetime`). |
+| `timezone` | `timezone`, `HKTimezone`, `HKTimeZone` | yes | IANA string (e.g., `"America/Los_Angeles"`). Missing/invalid values are handled via `timezone_missing_policy`. |
+| `utc_start`, `utc_end` | `utc_start`, `utc_end` | optional | If absent, computed from `local_start`/`local_end` + `timezone`. |
+| `local_start_tz`, `local_end_tz` | `local_start_tz`, `local_end_tz` | optional | If absent, computed during localization. |
+| `device.name` | `device.name` | optional | When present, the loader derives `device.name_id`. |
+
+Any additional columns (e.g., `device_source_id`, source identifiers, metadata) are retained as-is.
+
+### Public entry points
+
+All three methods accept `return_report=True`, which returns `(DataFrame, report)` instead of a DataFrame alone.
+
+#### `load_file(path, *, return_report=False)`
+
+Loads a single CSV and returns the normalized long-form DataFrame. Runs the full pipeline described above and also initializes/populates a per-file report dict. Raises `FileNotFoundError` if the path is missing and `ValueError` on a non-`.csv` suffix or a missing required column.
 
 ```python
 from healthkit_loader import HealthKitLoader
 
-loader = HealthKitLoader()  # uses default config
-
-# ── Load a single CSV or XML file ──
-df = loader.load_file("path/to/export.csv", user_id=101)
-
-# ── Load all files for one participant ──
-df = loader.load_participant("path/to/participant_folder", user_id=101)
-
-# ── Bulk-load an entire directory (recursive glob for CSV + XML) ──
-df = loader.load_bulk("path/to/exports")
-
-# ── With diagnostic report ──
-df, report = loader.load_bulk("path/to/exports", return_report=True)
+loader = HealthKitLoader()
+df = loader.load_file("path/to/101-heart.csv")
+df, report = loader.load_file("path/to/101-heart.csv", return_report=True)
 ```
+
+#### `load_participant(data_folder, user_id, sensor_folders=None, return_report=False)`
+
+Loads all HealthKit CSVs for a **single participant** from a conventional folder layout and concatenates them. Expected layout:
+
+```text
+<data_folder>/
+    <sensor_folder_a>/
+        <user_id>-<sensor_folder_a>.csv
+    <sensor_folder_b>/
+        <user_id>-<sensor_folder_b>.csv
+    ...
+```
+
+For each subfolder of `data_folder` (or each entry in `sensor_folders` if provided), the loader looks for `<user_id>-<folder_name>.csv`. Missing files are recorded in the report under `missing_files` and skipped silently; present files are passed through `load_file`. Returns an empty DataFrame if no files are found.
+
+```python
+# Auto-discover subfolders under data_folder
+df = loader.load_participant("/data/healthkit_exports", user_id=101)
+
+# Restrict to a specific list of sensor folders
+df = loader.load_participant(
+    "/data/healthkit_exports",
+    user_id=101,
+    sensor_folders=["heart", "steps", "sleep"],
+)
+```
+
+#### `load_bulk(root, *, patterns=("**/*.csv",), strict=False, return_report=False)`
+
+Recursively discovers CSVs under `root` using one or more `rglob` patterns, loads each with `load_file`, and concatenates the results. When `strict=False` (default), per-file exceptions are logged and recorded under `failed_files` in the report rather than halting the run. `strict=True` re-raises the first failure.
+
+```python
+# Default: recursive glob for all CSVs
+df = loader.load_bulk("/data/healthkit_exports")
+
+# Custom patterns (still limited to CSV — non-CSV files error in load_file)
+df = loader.load_bulk(
+    "/data/healthkit_exports",
+    patterns=("participants/*/heart/*.csv", "participants/*/steps/*.csv"),
+)
+
+# Fail fast on the first bad file
+df = loader.load_bulk("/data/healthkit_exports", strict=True)
+
+# With diagnostic report
+df, report = loader.load_bulk("/data/healthkit_exports", return_report=True)
+```
+
+A tqdm progress bar is shown while files are being loaded.
 
 ### Configuration (`HKLoadConfig`)
 
@@ -103,7 +172,7 @@ loader = HealthKitLoader(HKLoadConfig(
 ))
 ```
 
-Instead of overriding defaults when you create the config, another option is to change the default values in the healthkit_loader_specs.py file.
+Instead of overriding defaults when you create the config, you can also change the default values in `healthkit_loader_specs.py`.
 
 **All configuration fields:**
 
@@ -111,43 +180,59 @@ Instead of overriding defaults when you create the config, another option is to 
 |-------|------|---------|---------|-------------|
 | `timezone_missing_policy` | str | `"fill_default"` | `"fill_default"`, `"drop_rows"`, `"error"` | What to do when a row's timezone is missing or invalid. `"fill_default"` substitutes `default_tz`; `"drop_rows"` removes the row; `"error"` raises immediately. |
 | `default_tz` | str | `"America/Los_Angeles"` | Any valid IANA timezone | Fallback timezone string. Only used when `timezone_missing_policy` is `"fill_default"`. |
-| `dst_ambiguous` | str | `"infer"` | `"infer"`, `"NaT"`, `"raise"` | How to handle ambiguous times during fall-back (same clock time occurs twice). `"infer"` picks the most likely offset; `"NaT"` sets the timestamp to missing; `"raise"` raises an error. |
+| `dst_ambiguous` | str | `"infer"` | `"infer"`, `"NaT"`, `"raise"` | How to handle ambiguous times during fall-back (same clock time occurs twice). `"infer"` picks the most likely offset; `"NaT"` sets the timestamp to missing; `"raise"` raises an error. If `"infer"` fails on a group, the loader falls back to the second fold (standard time) and records the event in the DST report section. |
 | `dst_nonexistent` | str | `"shift_forward"` | `"shift_forward"`, `"NaT"`, `"raise"` | How to handle nonexistent times during spring-forward (clock skips ahead). `"shift_forward"` moves to the next valid time; `"NaT"` sets to missing; `"raise"` raises an error. |
 
 ### Output columns
 
-The loader always produces a DataFrame with at least these columns:
+The loader produces a long-form DataFrame containing at least these canonical columns:
 
 | Column | Description |
 |--------|-------------|
-| `user_id` | Participant identifier (integer) |
-| `type` | Normalized HealthKit type name (e.g., `"HeartRate"`, `"StepCount"`) |
-| `value` | Observation value (numeric or categorical string) |
-| `utc_start` / `utc_end` | UTC timestamps (datetime64) |
-| `local_start` / `local_end` | Local timestamps (datetime64, timezone-naive) |
+| `user_id` | Participant identifier (int64) |
+| `type` | Normalized HealthKit type name (e.g., `"HeartRate"`, `"StepCount"`, `"SleepAnalysis"`) |
+| `value` | Observation value — numeric for quantity types, string label for category types (e.g., `"InBed"`, `"Asleep"`) |
 | `timezone` | IANA timezone string (e.g., `"America/Los_Angeles"`) |
+| `local_start`, `local_end` | Naive local timestamps (datetime64, tz-stripped after localization) |
+| `local_start_tz`, `local_end_tz` | Timezone-aware local timestamps (datetime64) |
+| `utc_start`, `utc_end` | UTC timestamps (datetime64) |
+
+Additional columns that are created conditionally:
+
+| Column | When it appears |
+|--------|-----------------|
+| `device.name_id` | When the input CSV has a `device.name` column and does not already have `device.name_id`. Values: `2` (Apple Watch), `1` (iPhone), `0` (other); nullable `Int8`. |
+
+Any other columns present in the input CSV (e.g., `device.name`, `device_source_id`, source metadata) pass through unchanged.
 
 ### Reports
 
-Every loader method accepts `return_report=True`, which returns a `(DataFrame, report_dict)` tuple instead of just a DataFrame. Reports are nested dictionaries containing diagnostic information about the loading process.
+Every loader method accepts `return_report=True`, which returns a `(DataFrame, report_dict)` tuple. Reports are nested dictionaries containing diagnostic information about the loading process.
 
-**Single-file report structure** (from `load_file`):
-
-| Key | Contents |
-|-----|----------|
-| `__global__` | File path, file type (`"csv"` or `"xml"`), `rows_in_raw`, `rows_out`, `rows_dropped_total`, and `dropped_by_reason` breakdown |
-| `timezone` | Counts for `missing_column_rows`, `missing_value_rows`, `invalid_value_rows`, `filled_default_rows`, `dropped_rows`, plus `invalid_values_sample` |
-| `dst` | Counts for `fallback_ambiguous_false_rows`, `nonexistent_detected_rows`, `nonexistent_resolved_policy`, `ambiguous_infer_fail_rows`, and `fallback_samples` |
-| `xml_timezone` | XML-only: counts for `rows_inferred_nearest`, `rows_inferred_ffill`, `rows_inferred_bfill`, `rows_defaulted` |
-| `user_id` | `rows_in`, `rows_dropped_non_numeric`, `sample_values` |
-
-**Bulk report structure** (from `load_bulk`):
+**Single-file report** (returned by `load_file`; embedded in the `files` list of participant/bulk reports):
 
 | Key | Contents |
 |-----|----------|
-| `__global__` | `files_matched`, `files_loaded`, `files_failed`, total `rows_out` |
-| `files` | List of per-file report dicts (same structure as above) |
-| `failed_files` | List of `{"path": ..., "error": ...}` entries for files that failed to load |
+| `__global__` | `path`, `file_type` (always `"csv"`), `rows_in_raw`, `rows_out`, `rows_dropped_total`, and `dropped_by_reason` (a dict keyed by reason: `timezone_missing_or_invalid`, `user_id_non_numeric`). |
+| `timezone` | `missing_column_rows`, `missing_value_rows`, `invalid_value_rows`, `filled_default_rows`, `dropped_rows`, and `invalid_values_sample` (up to 5 unique bad TZ strings). |
+| `dst` | `fallback_ambiguous_false_rows`, `nonexistent_detected_rows`, `nonexistent_resolved_policy`, `ambiguous_infer_fail_rows`, `fallback_used` (bool), and `fallback_samples` (list of up to 5 per-row diagnostics: `row_index`, `user_id`, `timezone`, `label`, `local_time`). |
+| `user_id` | `rows_in`, `rows_dropped_non_numeric`, `sample_values` (up to 5 bad IDs). |
+
+**Participant report** (returned by `load_participant`):
+
+| Key | Contents |
+|-----|----------|
+| `__global__` | `data_folder`, `user_id`, `files_scanned`, `files_found`, `files_missing`, `rows_out`. |
+| `files` | List of per-file reports (same structure as `load_file`). |
+| `missing_files` | List of expected-but-absent file paths. |
+
+**Bulk report** (returned by `load_bulk`):
+
+| Key | Contents |
+|-----|----------|
+| `__global__` | `root`, `patterns`, `files_matched`, `files_loaded`, `files_failed`, `rows_out`. |
+| `files` | List of per-file reports for successfully loaded files. |
+| `failed_files` | List of `{"path": ..., "error_type": ..., "error": ...}` entries for files that raised (only populated when `strict=False`). |
 
 Reports can be saved to JSON for later analysis:
 
@@ -478,6 +563,8 @@ wide_qc, report_qc = aggregator.apply_quality_control(wide, aux)
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `apply_zero_fill` | bool | `False` | When enabled, fills missing-but-expected observations with zeros when the type's `zero_fill_gate` condition is met (e.g., watch was worn but no steps were recorded → `StepCount__sum = 0`) |
+| `apply_sleep_qc_fill_nan` | bool | `False` | When enabled, apply_sleep_quality_control() will fill missing daily sleep stage/category aggregates with zeros when sleep duration is present |
+
 
 #### HRV
 
@@ -582,6 +669,60 @@ sleep_df = aggregator.compute_daily_sleep_features(cleaned_df, qc=True)
 sleep_df = aggregator.apply_sleep_quality_control(sleep_df)
 ```
 
+Days are anchored at 15:00 local time (so a night of sleep is attributed to the calendar date it wakes up on). `InBed` coverage is the union of all sleep-analysis labels (`InBed`, any `Asleep*`, any `Awake*`, `CategoryValueUnknown`); `Asleep` coverage is every label except the explicit `Awake*` labels. Clock-hour features are expressed as hours since the prior local midnight (so 26.5 = 02:30 the next morning).
+
+Output has one row per (`user_id`, `date`) with the columns below.
+
+**Identifiers**
+
+| Column | Description |
+|---|---|
+| `user_id` | Participant identifier carried through from the input. |
+| `date` | Local calendar date the night/day is attributed to (the day *after* the 15:00 anchor). |
+
+**Durations and timing (hours)**
+
+| Column | Description |
+|---|---|
+| `sleep_bedrest_duration_day` | Total time in bed — sum of durations of all in-bed-category segments on the day. |
+| `sleep_sleep_duration_day` | Total sleep time (TST) — sum of durations of all asleep-category segments. |
+| `sleep_awake_duration_day` | Total time labeled `Awake`/`AwakeUnspecified` during the in-bed window. |
+| `sleep_wake_after_sleep_onset_day` | WASO: `awake_duration` minus the first awake segment between bedrest onset and sleep onset (i.e., awakenings after first sleep onset). |
+| `sleep_sleep_onset_latency_day` | Time from bedrest onset to first sleep onset. |
+| `sleep_bedrest_onset_hours_day` | Clock hour of first in-bed segment, in hours since prior local midnight (values > 24 cross midnight). |
+| `sleep_bedrest_offset_hours_day` | Clock hour of the last in-bed segment's end. |
+| `sleep_sleep_onset_hours_day` | Clock hour of first asleep segment. |
+| `sleep_sleep_offset_hours_day` | Clock hour of last asleep segment's end. |
+
+**Quality and context**
+
+| Column | Description |
+|---|---|
+| `sleep_efficiency_day` | `sleep_duration / bedrest_duration`, clipped to [0, 1]; 0 is coerced to NaN. |
+| `sleep_hr_median_day` | Median `HeartRate` across samples falling inside the sleep window (`sleep_onset` to `sleep_offset`). BPM. |
+| `sleep_hrv_median_day` | Median `HeartRateVariabilitySDNN` across samples inside the sleep window. Milliseconds. |
+| `sleep_bedrest_audio_median_day` | Median `EnvironmentalAudioExposure` across samples inside the bedrest window. dBA. |
+
+**Per-stage statistics**
+For each sleep-analysis label `<stage>` observed on the day (`InBed`, `Asleep`, `AsleepUnspecified`, `AsleepCore`, `AsleepDeep`, `AsleepREM`, `Awake`, `AwakeUnspecified`, `CategoryValueUnknown`), three columns are emitted:
+
+| Column pattern | Description |
+|---|---|
+| `sleep_<stage>_sum_day` | Total duration of segments with this label (hours). |
+| `sleep_<stage>_mean_day` | Mean segment duration for this label (hours). |
+| `sleep_<stage>_count_day` | Number of segments with this label. |
+
+Stage columns only appear when that label is present in the input, so the exact column set varies by device and participant (e.g., watchOS ≥ 9 devices emit `AsleepCore`/`AsleepDeep`/`AsleepREM`; older sources emit only `Asleep`).
+
+#### QC behavior (when `qc=True`)
+
+`apply_sleep_quality_control` runs after feature assembly and applies these adjustments in place:
+
+- `sleep_efficiency_day`: 0 → NaN; values > 1 clipped to 1.
+- `sleep_sleep_duration_day`, `sleep_bedrest_duration_day`: 0 → NaN.
+- `sleep_Awake_sum_day`: values > 20 h → NaN.
+- If `HKAggConfig.apply_sleep_qc_fill_nan` is set, rows that have a non-NaN `sleep_sleep_duration_day` get missing `InBed`/`Asleep`/`Awake`/`CategoryValueUnknown` stage stats (sum/mean/count) filled with 0.
+
 ### Reports
 
 The `report` dict from `run_aggregation` contains:
@@ -685,14 +826,14 @@ print(f"Day valid rate: {agg_report['wear']['day_valid_rate']:.1%}")
 ## Data Flow
 
 ```text
-Apple HealthKit exports (CSV / XML)
+Apple HealthKit CSV exports
               │
               ▼
 ┌─────────────────────────────────┐
 │  HealthKitLoader                │  healthkit_loader.py
 │  HKLoadConfig                   │  healthkit_loader_specs.py
 │                                 │
-│  • Parse CSV / XML files        │
+│  • Parse CSV files              │
 │  • Normalize types & values     │
 │  • Resolve timezones & DST      │
 │  • Produce UTC + local times    │
