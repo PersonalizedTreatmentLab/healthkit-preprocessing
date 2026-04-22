@@ -73,11 +73,11 @@ The pipeline recognizes the following Apple HealthKit types out-of-the-box. Each
 | `EnvironmentalAudioExposureEvent` | categorical_interval | cat | either | `sum`, `mean`, `count` for the `momentary_limit` label |
 
 **Time-behavior categories, at a glance:**
-
+Assignment to aggregation windows works differently depending on the time behavior of the stream.
 - **interval_total** — cumulative counts/totals over an interval (e.g., steps in a 10-minute window). Values are split proportionally across window boundaries when intervals straddle them.
 - **interval_level** — a sustained level maintained over an interval (e.g., ambient dB). Aggregation is time-weighted.
 - **point** — an instantaneous sample at one moment (e.g., a single heart-rate reading). Observations are assigned to whichever window contains the sample timestamp.
-- **categorical_interval** — a labeled interval (e.g., a sleep stage). Per-label durations, counts, and boundary timestamps are tracked.
+- **categorical_interval** — a labeled interval (e.g., a sleep stage). Observations are split at the window boundary and maintain the same label.
 
 **Device-class meanings:**
 
