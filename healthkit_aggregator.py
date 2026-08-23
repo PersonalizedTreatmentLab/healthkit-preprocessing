@@ -9,20 +9,8 @@ This module defines `HealthKitAggregator`, which:
 - optionally applies quality control (drop/mask) and supports hierarchical rollups via LayerSpec.
 
 Primary entrypoints:
-- run_aggregation(df, schedule=None, assessments=None, duration_before=None) -> (wide, report, aux)
+- run_aggregation(df, schedule=None, assessments=None, assessment_window=None) -> (wide, report, aux)
 - apply_quality_control(wide, aux) -> (wide_qc, report_qc)
-
--------
-Misc. Ideas
-- Daily sleep features mirrors Samir's. Note: AwakeUnspecified labeled ASLEEP, durations aren't split - any segment that spans the 3 pm boundary is fully counted on the start day, first()/last() within the 3 pm day will happily pick a mid-day nap for bedrestOffset or sleepOffset, EnvironmentalAudioExposure should use appropriate leq methods instead of simple median, source/wear gating isn't connected.
-- AggregationPlan: Easier way to compute features at different levels? What if I want cardio, vitals, audio to be granular → hourly → daily, but sleep to be granular → daily?
-    - While not currently used, bin windows with tz_mode "local", bin_origin 15:00, bin_size "1D" parallel Samir's nightly bins.
-- Aggregation relies on time behavior. Ideally, I'd have something like op_registry apply to all aggregations.
-- Note: Many window/time columns less reliable if doing hierarchical aggregation. Decision rules may not reflect preferences in all cases.
-- Note: Sleep / environmental audio event count can't be summed to find the number of observations. Original samples are split across bin boundaries and can be recounted in each bin they're in.
-    - Unable to get exact rollups for means because counts refer to fragments rather than observations.
-- What are all the possible sleepAnalysis values? Could sleep events better be aggregated?
-- Currently uses source for some things, derived from `source_device_model` column. Check possible values and distributions over the full dataset. Will this work as intended?
 """
 from __future__ import annotations
 from copy import deepcopy
@@ -30,12 +18,64 @@ from dataclasses import asdict
 from typing import Dict, List, Optional, Tuple, Any, Iterable, Callable
 import os
 import numpy as np, pandas as pd
-from healthkit_aggregator_specs import HKAggConfig, LayerSpec, build_default_op_registry
+from healthkit_aggregator_specs import (
+    AssessmentWindowSpec,
+    HKAggConfig,
+    LayerSpec,
+    build_default_op_registry,
+)
 import healthkit_aggregator_time as hk_time
 from zoneinfo import ZoneInfo
 from healthkit_hrv import HRVComputer, compute_hrv_features_for_windows
 import logging
 import time
+
+# Normalized sleep labels and device-portable unions used by granular and
+# daily sleep aggregation. ``AwakeUnspecified`` intentionally belongs to both
+# asleep and awake unions because the source category is semantically
+# ambiguous and both definitions are useful modeling inputs.
+IN_BED_CATEGORIES = [
+    "InBed", "Asleep", "AsleepUnspecified", "CategoryValueUnknown",
+    "Awake", "AwakeUnspecified", "AsleepCore", "AsleepDeep", "AsleepREM",
+]
+ASLEEP_CATEGORIES = [
+    "Asleep", "AsleepUnspecified", "AwakeUnspecified", "CategoryValueUnknown",
+    "AsleepCore", "AsleepDeep", "AsleepREM",
+]
+AWAKE_CATEGORIES = ["Awake", "AwakeUnspecified"]
+
+SLEEP_LABEL_MAP = {
+    "in_bed": "InBed",
+    "asleep": "Asleep",
+    "asleep_unspecified": "AsleepUnspecified",
+    "asleep_core": "AsleepCore",
+    "asleep_deep": "AsleepDeep",
+    "asleep_rem": "AsleepREM",
+    "awake": "Awake",
+    "awake_unspecified": "AwakeUnspecified",
+    "sleep_unknown": "CategoryValueUnknown",
+}
+
+SLEEP_ANY_GROUPS = (
+    ("in_bed", IN_BED_CATEGORIES),
+    ("asleep", ASLEEP_CATEGORIES),
+    ("awake", AWAKE_CATEGORIES),
+)
+
+
+def _interval_continuity_masks(
+    block: pd.DataFrame, start_col: str, end_col: str
+) -> Tuple[pd.Series, pd.Series]:
+    """Return masks for original intervals that strictly cross either edge."""
+    continues_from_previous = (
+        (block[start_col] < block["window_start"])
+        & (block[end_col] > block["window_start"])
+    )
+    continues_into_next = (
+        (block[start_col] < block["window_end"])
+        & (block[end_col] > block["window_end"])
+    )
+    return continues_from_previous, continues_into_next
 
 # ============================================================================
 # HealthKitAggregator class
@@ -43,7 +83,7 @@ import time
 class HealthKitAggregator:
     """
     Public API:
-      run_aggregation(df, schedule=None, assessments=None, duration_before=None) → (wide, report, aux)
+      run_aggregation(df, schedule=None, assessments=None, assessment_window=None) → (wide, report, aux)
       apply_quality_control(wide, aux) → (wide_qc, report_qc)
 
       aggregate_layer(child, spec, prev_layer_name=None)
@@ -63,8 +103,8 @@ class HealthKitAggregator:
         self.logger = logger or logging.getLogger(__name__)
 
         # Caches/registries
-        self.zero_fill_eligible: Dict[str, set] = {t: set(meta.get("zero_fill_stats", set())) for t, meta in self.cfg.type_registry.items()}
         self.op_registry = build_default_op_registry()
+        self._last_daily_feature_names: List[str] = []
 
         # Bin anchoring (UTC epoch + origin)
         self._epoch_utc = pd.Timestamp("1970-01-01 00:00:00", tz="UTC")
@@ -76,14 +116,21 @@ class HealthKitAggregator:
         self.report: Dict[str, Any] = self._new_report()
 
         # Zero-fill plan
-        self._zero_fill_plan: List[Tuple[str, Tuple[str, ...], Tuple[str, Dict[str, Any]], float]] = []
+        self._zero_fill_plan: List[
+            Tuple[str, str, Tuple[str, Dict[str, Any]], float, str]
+        ] = []
         for tname, meta in self.cfg.type_registry.items():
-            eligible = tuple(sorted(meta.get("zero_fill_stats", set())))
-            if not eligible:
-                continue
-            gate_spec = meta.get("zero_fill_gate", ("expr_false", {}))
-            gate_spec = self._normalize_zero_fill_gate(gate_spec)
-            self._zero_fill_plan.append((tname, eligible, gate_spec, 0.0))
+            for statistic, rule in meta.get("zero_fill_rules", {}).items():
+                gate_spec = self._normalize_zero_fill_gate(rule["gate"])
+                self._zero_fill_plan.append(
+                    (
+                        tname,
+                        statistic,
+                        gate_spec,
+                        float(rule["fill_value"]),
+                        str(rule["availability"]),
+                    )
+                )
 
         # HRV computer (if enabled)
         self.hrv_computer = None
@@ -110,6 +157,120 @@ class HealthKitAggregator:
             "timing": {},
             "config_snapshot": asdict(self.cfg),
         }
+
+    def _configured_granular_feature_names(self) -> List[str]:
+        """Return configured granular feature names in deterministic order."""
+        return [
+            f"{type_name}__{statistic}"
+            for type_name, metadata in self.cfg.type_registry.items()
+            for statistic in metadata.get("aggregates", ())
+        ]
+
+    @staticmethod
+    def _feature_units(statistic: str) -> str:
+        if statistic.startswith(("sum_label_", "mean_label_", "sum_any_", "mean_any_")):
+            return "seconds"
+        if statistic in {"duration", "median_duration"}:
+            return "seconds"
+        if statistic.startswith("count") or statistic == "count":
+            return "count"
+        if statistic.startswith("continues_"):
+            return "indicator"
+        if statistic == "rate_per_min":
+            return "source_unit_per_minute"
+        return "source_unit"
+
+    @staticmethod
+    def _feature_value_type(statistic: str) -> str:
+        if statistic.startswith("continues_"):
+            return "indicator"
+        if statistic.startswith("count") or statistic == "count":
+            return "count"
+        return "continuous"
+
+    @staticmethod
+    def _label_or_union(statistic: str) -> Optional[str]:
+        if "_label_" in statistic:
+            return f"label:{statistic.split('_label_', 1)[1]}"
+        if "_any_" in statistic:
+            return f"union:{statistic.split('_any_', 1)[1]}"
+        return None
+
+    def get_feature_manifest(self) -> pd.DataFrame:
+        """Describe the deterministic configured feature schema."""
+        rows: List[Dict[str, Any]] = []
+        for type_name, metadata in self.cfg.type_registry.items():
+            rules = metadata.get("zero_fill_rules", {})
+            for statistic in metadata.get("aggregates", ()):
+                rule = rules.get(statistic)
+                if rule is None:
+                    zero_fill = "not_configured"
+                else:
+                    gate, params = self._normalize_zero_fill_gate(rule["gate"])
+                    gate_text = gate if not params else f"{gate}:{params}"
+                    zero_fill = (
+                        f"gate={gate_text}; fill={float(rule['fill_value'])}; "
+                        f"availability={rule['availability']}"
+                    )
+                rows.append(
+                    {
+                        "feature_name": f"{type_name}__{statistic}",
+                        "cadence": "granular",
+                        "source_type": type_name,
+                        "aggregation": statistic.split("_label_", 1)[0].split("_any_", 1)[0],
+                        "label_or_union": self._label_or_union(statistic),
+                        "units": self._feature_units(statistic),
+                        "value_type": self._feature_value_type(statistic),
+                        "device_class": metadata.get("device_class", "unspecified"),
+                        "zero_fill_semantics": zero_fill,
+                    }
+                )
+        for feature_name in self._last_daily_feature_names:
+            if feature_name == "sleep_date":
+                continue
+            source_type = "SleepAnalysis"
+            aggregation = "daily_sleep"
+            label_or_union = None
+            units = "hours"
+            value_type = "continuous"
+            if feature_name == "sleep_sleep_hr_median_day":
+                source_type, aggregation, units = "HeartRate", "median_in_asleep_records", "source_unit"
+            elif feature_name == "sleep_sleep_hrv_median_day":
+                source_type, aggregation, units = "HeartRateVariabilitySDNN", "median_in_asleep_records", "source_unit"
+            elif feature_name == "sleep_bedrest_audio_median_day":
+                source_type, aggregation, units = "EnvironmentalAudioExposure", "median_in_bedrest_records", "source_unit"
+            elif feature_name in {"sleep_efficiency_day", "sleep_day_elapsed_fraction"}:
+                units = "fraction"
+            elif feature_name.endswith("_count_day"):
+                aggregation, units, value_type = "count", "count", "count"
+                label_or_union = f"label:{feature_name[6:-10]}"
+            elif feature_name.endswith("_sum_day"):
+                aggregation = "sum"
+                label_or_union = f"label:{feature_name[6:-8]}"
+            elif feature_name.endswith("_mean_day"):
+                aggregation = "mean"
+                label_or_union = f"label:{feature_name[6:-9]}"
+            rows.append(
+                {
+                    "feature_name": feature_name,
+                    "cadence": "daily",
+                    "source_type": source_type,
+                    "aggregation": aggregation,
+                    "label_or_union": label_or_union,
+                    "units": units,
+                    "value_type": value_type,
+                    "device_class": self.cfg.type_registry.get(
+                        source_type, {"device_class": "either"}
+                    ).get("device_class", "either"),
+                    "zero_fill_semantics": (
+                        "optional_daily_stage_fill"
+                        if feature_name.startswith("sleep_")
+                        and feature_name.endswith(("_sum_day", "_mean_day", "_count_day"))
+                        else "not_configured"
+                    ),
+                }
+            )
+        return pd.DataFrame(rows)
 
     # ------------------------------------------------------------------------
     # Input Normalization
@@ -161,8 +322,8 @@ class HealthKitAggregator:
         has_local = {"local_start","local_end"}.issubset(df.columns)
 
         if has_utc:
-            df["utc_start"] = pd.to_datetime(df["utc_start"], utc=True, format="mixed").dt.tz_convert("UTC")
-            df["utc_end"]   = pd.to_datetime(df["utc_end"],   utc=True, format="mixed").dt.tz_convert("UTC")
+            df["utc_start"] = pd.to_datetime(df["utc_start"], utc=True).dt.tz_convert("UTC")
+            df["utc_end"]   = pd.to_datetime(df["utc_end"],   utc=True).dt.tz_convert("UTC")
         elif has_local:
             tzcol = "timezone" if "timezone" in df.columns else None
             if tzcol is None: raise ValueError("Provide 'timezone' column for local inputs or pass 'utc_start/utc_end'.")
@@ -238,14 +399,20 @@ class HealthKitAggregator:
         )
         return windows, sch
 
-    def build_assessment_anchored_windows(self, assessments: pd.DataFrame, schedule: Optional[pd.DataFrame], duration_before: Optional[Any] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Construct per-user assessment anchored windows; attach local projection labels once."""
-        dur = duration_before if duration_before is not None else self.cfg.assessment_duration_before
-        windows, sch = hk_time.build_assessment_anchored_windows(
+    def build_assessment_windows(
+        self,
+        assessments: pd.DataFrame,
+        schedule: Optional[pd.DataFrame],
+        window_spec: AssessmentWindowSpec,
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Construct validated per-assessment lookback windows."""
+        windows, sch = hk_time.build_assessment_windows(
             assessments=assessments,
             schedule=schedule,
             tz_policy=self.cfg.tz_policy,
-            duration_before=dur,
+            window_spec=window_spec,
+            default_bin_origin=self.cfg.bin_origin,
+            default_tz_mode=self.cfg.tz_mode_l0,
             report=self.report,
         )
         return windows, sch
@@ -677,6 +844,8 @@ class HealthKitAggregator:
                     coverage_end = pts + pd.to_timedelta(cov, unit="s")
                     cov_seconds = self._compute_overlap_seconds(pts, coverage_end, dft["window_start"], dft["window_end"])
                     dft["coverage_seconds"] = cov_seconds.clip(upper=dft["window_seconds"])
+                elif tname == self.cfg.hr_type:
+                    dft["coverage_seconds"] = pd.Series(dtype="float64")
 
                 keep_cols = ["user_id", "window_id", "window_start", "window_end", "window_seconds", "value"]
                 if tname == self.cfg.hr_type:
@@ -719,6 +888,45 @@ class HealthKitAggregator:
         See healthkit_aggregator_specs.py for operations available by default"""
         self.op_registry[key] = fn
 
+    @staticmethod
+    def _attach_interval_continuity(
+        intermediate: pd.DataFrame,
+        out: pd.DataFrame,
+        cols_key: List[str],
+        tname: str,
+        requested: Iterable[str],
+    ) -> None:
+        """Attach strict previous/next-bin continuity indicators to ``out``."""
+        previous_name = "continues_from_previous_bin"
+        next_name = "continues_into_next_bin"
+        if previous_name not in requested and next_name not in requested:
+            return
+        start_col = "utc_start" if "utc_start" in intermediate.columns else (
+            "local_start" if "local_start" in intermediate.columns else None
+        )
+        end_col = "utc_end" if "utc_end" in intermediate.columns else (
+            "local_end" if "local_end" in intermediate.columns else None
+        )
+        if not (start_col and end_col):
+            return
+        previous, following = _interval_continuity_masks(
+            intermediate, start_col, end_col
+        )
+        tmp = intermediate[cols_key].copy()
+        tmp["_continues_from_previous"] = previous.to_numpy()
+        tmp["_continues_into_next"] = following.to_numpy()
+        flags = tmp.groupby(cols_key, sort=False)[
+            ["_continues_from_previous", "_continues_into_next"]
+        ].any()
+        if previous_name in requested:
+            out[f"{tname}__{previous_name}"] = (
+                flags["_continues_from_previous"].astype(float).reindex(out.index)
+            )
+        if next_name in requested:
+            out[f"{tname}__{next_name}"] = (
+                flags["_continues_into_next"].astype(float).reindex(out.index)
+            )
+
     def aggregate_type_within_windows(self, tname: str, intermediate: pd.DataFrame) -> pd.DataFrame:
         """
         Reduce per-type intermediate fragments into per-window aggregates.
@@ -747,6 +955,9 @@ class HealthKitAggregator:
             if "sum_of_squares" in requested:
                 v2 = intermediate.assign(v2=intermediate["value"] ** 2)
                 out[f"{tname}__sum_of_squares"] = v2.groupby(cols_key, sort=False)["v2"].sum().reindex(out.index)
+            self._attach_interval_continuity(
+                intermediate, out, cols_key, tname, requested
+            )
             return out.reset_index()
 
         if time_behavior == "interval_level":
@@ -821,6 +1032,9 @@ class HealthKitAggregator:
 
             out = pd.concat(pieces, axis=1)
             out = out.loc[:, ~out.columns.duplicated()]
+            self._attach_interval_continuity(
+                intermediate, out, cols_key, tname, requested
+            )
             return out.reset_index()
 
         if time_behavior == "point":
@@ -863,9 +1077,11 @@ class HealthKitAggregator:
         if time_behavior == "categorical_interval":
             requested = set(requested)
             if tname == "SleepAnalysis":
-                label_map = {"in_bed": "InBed", "asleep": "Asleep", "awake": "Awake", "sleep_unknown": "CategoryValueUnknown"}
+                label_map = SLEEP_LABEL_MAP
+                any_groups = SLEEP_ANY_GROUPS
             elif tname == "EnvironmentalAudioExposureEvent":
                 label_map = {"momentary_limit": "MOMENTARY_LIMIT"}
+                any_groups = ()
             else:
                 return intermediate[cols_key].drop_duplicates()
 
@@ -880,29 +1096,69 @@ class HealthKitAggregator:
                     if f"mean_label_{suf}" in requested: out[f"{tname}__mean_label_{suf}"] = float(durs.mean()) if len(durs) else np.nan
                     if f"count_label_{suf}" in requested: out[f"{tname}__count_label_{suf}"] = float(len(durs)) if len(durs) else np.nan
                 if start_col and end_col:
-                    m_start = (block[start_col] <= block["window_start"]) & (block[end_col] > block["window_start"])
-                    m_end   = (block[start_col] < block["window_end"]) & (block[end_col] >= block["window_end"])
+                    m_start, m_end = _interval_continuity_masks(
+                        block, start_col, end_col
+                    )
                 else:
                     m_start = pd.Series(False, index=block.index); m_end = pd.Series(False, index=block.index)
 
-                start_label = block.loc[m_start,"label"].astype(str); end_label = block.loc[m_end,"label"].astype(str)
-                start_val = start_label.iloc[0] if len(start_label) else None
-                end_val = end_label.iloc[0] if len(end_label) else None
                 for suf, raw in label_map.items():
-                    if f"start_label_{suf}" in requested:
-                        out[f"{tname}__start_label_{suf}"] = 1.0 if (start_val == raw) else (0.0 if start_val is not None else np.nan)
-                    if f"end_label_{suf}" in requested:
-                        out[f"{tname}__end_label_{suf}"] = 1.0 if (end_val == raw) else (0.0 if end_val is not None else np.nan)
+                    label_present = block["label"].astype(str).eq(raw)
+                    previous_name = f"continues_from_previous_bin_label_{suf}"
+                    next_name = f"continues_into_next_bin_label_{suf}"
+                    if previous_name in requested:
+                        out[f"{tname}__{previous_name}"] = (
+                            float((m_start & label_present).any())
+                            if label_present.any() else np.nan
+                        )
+                    if next_name in requested:
+                        out[f"{tname}__{next_name}"] = (
+                            float((m_end & label_present).any())
+                            if label_present.any() else np.nan
+                        )
+                for suf, categories in any_groups:
+                    selected = block["label"].astype(str).isin(categories)
+                    durs = block.loc[selected, "duration"].astype(float)
+                    if f"sum_any_{suf}" in requested:
+                        out[f"{tname}__sum_any_{suf}"] = float(durs.sum()) if selected.any() else np.nan
+                    if f"mean_any_{suf}" in requested:
+                        out[f"{tname}__mean_any_{suf}"] = float(durs.mean()) if selected.any() else np.nan
+                    if f"count_any_{suf}" in requested:
+                        out[f"{tname}__count_any_{suf}"] = float(len(durs)) if selected.any() else np.nan
+                    previous_name = f"continues_from_previous_bin_any_{suf}"
+                    next_name = f"continues_into_next_bin_any_{suf}"
+                    if previous_name in requested:
+                        out[f"{tname}__{previous_name}"] = (
+                            float((m_start & selected).any()) if selected.any() else np.nan
+                        )
+                    if next_name in requested:
+                        out[f"{tname}__{next_name}"] = (
+                            float((m_end & selected).any()) if selected.any() else np.nan
+                        )
                 return pd.Series(out)
 
-            return g.apply(_agg_block)
+            result = g.apply(_agg_block)
+            ordered_features = [
+                f"{tname}__{statistic}"
+                for statistic in meta.get("aggregates", ())
+                if f"{tname}__{statistic}" in result.columns
+            ]
+            other_columns = [
+                column for column in result.columns
+                if column not in cols_key and column not in ordered_features
+            ]
+            return result[
+                [column for column in cols_key if column in result.columns]
+                + ordered_features
+                + other_columns
+            ]
 
         raise NotImplementedError(f"Unknown time_behavior: {time_behavior}")
 
     def assemble_feature_matrix(self, windows: pd.DataFrame, per_type_agg: Dict[str, pd.DataFrame]) -> pd.DataFrame:
         """Merge all per-type aggregates onto the window grid (outer-left joins)."""
         keys = ["user_id","window_id","window_start","window_end","window_seconds"]
-        wide = windows[keys + (["bin_index"] if "bin_index" in windows.columns else [])].copy()
+        wide = windows.copy()
         wide_idx = wide.set_index(keys)
         non_empty_counts = {}
         for tname, df_t in per_type_agg.items():
@@ -914,7 +1170,20 @@ class HealthKitAggregator:
             non_empty_counts[tname] = int(df_t.dropna(how="all", subset=feat_cols).shape[0])
 
         self.report["bins"]["non_empty_bin_counts_by_type"] = non_empty_counts
-        return wide_idx.reset_index()
+        wide = wide_idx.reset_index()
+        expected = self._configured_granular_feature_names()
+        missing_features = [feature for feature in expected if feature not in wide.columns]
+        if missing_features:
+            empty_features = pd.DataFrame(
+                np.nan, index=wide.index, columns=missing_features
+            )
+            wide = pd.concat([wide, empty_features], axis=1)
+        metadata = [column for column in windows.columns if column in wide.columns]
+        extras = [
+            column for column in wide.columns
+            if column not in metadata and column not in expected
+        ]
+        return wide[metadata + expected + extras]
 
     # ------------------------------------------------------------------------
     # Compute Wear Metrics
@@ -1112,9 +1381,15 @@ class HealthKitAggregator:
                 end_utc = end_local.tz_convert("UTC")
 
                 # Assign as Series aligned to days' index -> preserves datetime64[ns, UTC] dtype
-                days.loc[idx, "start_utc"] = pd.Series(start_utc, index=days.index[idx], dtype="datetime64[ns, UTC]")
-                days.loc[idx, "end_utc"] = pd.Series(end_utc, index=days.index[idx], dtype="datetime64[ns, UTC]")
-                days.loc[idx, "day_seconds_expected"] = (end_utc - start_utc) / np.timedelta64(1, "s")
+                start_values = days["start_utc"].copy()
+                end_values = days["end_utc"].copy()
+                expected_values = days["day_seconds_expected"].copy()
+                start_values.loc[idx] = pd.Series(start_utc, index=days.index[idx], dtype="datetime64[ns, UTC]")
+                end_values.loc[idx] = pd.Series(end_utc, index=days.index[idx], dtype="datetime64[ns, UTC]")
+                expected_values.loc[idx] = (end_utc - start_utc) / np.timedelta64(1, "s")
+                days["start_utc"] = start_values
+                days["end_utc"] = end_values
+                days["day_seconds_expected"] = expected_values
 
             # Fallback for missing tz_name: treat as UTC civil day
             na_idx = days["tz_name"].isna()
@@ -1123,9 +1398,15 @@ class HealthKitAggregator:
                 start_utc = pd.DatetimeIndex(dvals).tz_localize("UTC")
                 end_utc = start_utc + pd.Timedelta(days=1)
 
-                days.loc[na_idx, "start_utc"] = pd.Series(start_utc, index=days.index[na_idx], dtype="datetime64[ns, UTC]")
-                days.loc[na_idx, "end_utc"] = pd.Series(end_utc, index=days.index[na_idx], dtype="datetime64[ns, UTC]")
-                days.loc[na_idx, "day_seconds_expected"] = 86400.0
+                start_values = days["start_utc"].copy()
+                end_values = days["end_utc"].copy()
+                expected_values = days["day_seconds_expected"].copy()
+                start_values.loc[na_idx] = pd.Series(start_utc, index=days.index[na_idx], dtype="datetime64[ns, UTC]")
+                end_values.loc[na_idx] = pd.Series(end_utc, index=days.index[na_idx], dtype="datetime64[ns, UTC]")
+                expected_values.loc[na_idx] = 86400.0
+                days["start_utc"] = start_values
+                days["end_utc"] = end_values
+                days["day_seconds_expected"] = expected_values
 
             # Final coercion safety net (if anything slipped to object)
             days["start_utc"] = _to_utc_dt(days["start_utc"])
@@ -1312,26 +1593,12 @@ class HealthKitAggregator:
         return out
 
     def _sanitize_output_schema(self, wide: pd.DataFrame) -> pd.DataFrame:
-        """Clean known merge artifacts while preserving data columns."""
+        """Remove empty index artifacts while preserving data columns."""
         if wide is None or wide.empty:
             return wide
 
         out = wide.copy()
 
-        # Defensive coalesce for legacy merge artifacts.
-        if "bin_index_x" in out.columns or "bin_index_y" in out.columns:
-            if "bin_index" not in out.columns:
-                if "bin_index_x" in out.columns and "bin_index_y" in out.columns:
-                    out["bin_index"] = out["bin_index_x"].where(out["bin_index_x"].notna(), out["bin_index_y"])
-                elif "bin_index_x" in out.columns:
-                    out["bin_index"] = out["bin_index_x"]
-                else:
-                    out["bin_index"] = out["bin_index_y"]
-            drop_bin_artifacts = [c for c in ("bin_index_x", "bin_index_y") if c in out.columns]
-            if drop_bin_artifacts:
-                out = out.drop(columns=drop_bin_artifacts)
-
-        # Drop truly empty index artifact only.
         if "index" in out.columns and out["index"].isna().all():
             out = out.drop(columns=["index"])
 
@@ -1445,33 +1712,28 @@ class HealthKitAggregator:
     # ------------------------------------------------------------------------
     # Zero-Fill Policy
     # ------------------------------------------------------------------------
+    @staticmethod
+    def build_participant_availability(df: pd.DataFrame) -> Dict[str, Dict[Any, set]]:
+        """Build per-participant type and categorical-label evidence."""
+        type_users: Dict[str, set] = {}
+        label_users: Dict[Tuple[str, str], set] = {}
+        if df is None or df.empty:
+            return {"type_users": type_users, "label_users": label_users}
+
+        for type_name, block in df.groupby("type", sort=False):
+            type_users[str(type_name)] = set(block["user_id"].dropna().tolist())
+            if str(type_name) in {"SleepAnalysis", "EnvironmentalAudioExposureEvent"}:
+                for label, label_block in block.groupby(block["value"].astype(str), sort=False):
+                    label_users[(str(type_name), str(label))] = set(
+                        label_block["user_id"].dropna().tolist()
+                    )
+        return {"type_users": type_users, "label_users": label_users}
+
     def _normalize_zero_fill_gate(self, gate: Any) -> Tuple[str, Dict[str, Any]]:
         """Normalize zero-fill gate spec to (op, params)."""
         if isinstance(gate, tuple) and len(gate) == 2 and isinstance(gate[0], str) and isinstance(gate[1], dict):
             return gate[0], dict(gate[1])
-
-        if isinstance(gate, str):
-            s = gate.strip()
-            if s == "" or s == "expr_false":
-                return "expr_false", {}
-            if s == "watch_on":
-                return "watch_on", {}
-            if s.startswith("watch_on:"):
-                parts = s.split(":", 1)[1]
-                kv = dict(kv.split("=") for kv in parts.split(",") if "=" in kv)
-                return "watch_on", {"min_fraction": float(kv.get("min_fraction", 0.0))}
-            if s.startswith("source_present:"):
-                return "source_present", {"source": s.split(":", 1)[1].strip().lower()}
-            if s == "any_source_present":
-                return "any_source_present", {}
-            if s == "any_non_watch_present":
-                return "any_non_watch_present", {}
-            if s.startswith("presence_types:"):
-                types = [t.strip() for t in s.split(":", 1)[1].split(",") if t.strip()]
-                return "presence_types", {"types": types}
-            return "expr_false", {}
-
-        return "expr_false", {}
+        raise ValueError("zero-fill gate must be a (name, parameters) tuple")
 
     def _compute_zero_fill_gate_mask(self, ctx: pd.DataFrame, gate: Tuple[str, Dict[str, Any]], presence_maps: Dict[str, set]) -> pd.Series:
         """Return a boolean Series mask for gate (op, params) evaluated over ctx."""
@@ -1510,10 +1772,47 @@ class HealthKitAggregator:
 
         return pd.Series(False, index=ctx.index)
 
-    def apply_zero_fill_policy(self, wide: pd.DataFrame, presence_frame: pd.DataFrame, presence_by_type: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    def _availability_mask(
+        self,
+        wide_indexed: pd.DataFrame,
+        type_name: str,
+        statistic: str,
+        policy: str,
+        participant_availability: Dict[str, Dict[Any, set]],
+    ) -> np.ndarray:
+        if policy == "assume_available":
+            return np.ones(len(wide_indexed), dtype=bool)
+
+        type_users = participant_availability.get("type_users", {})
+        label_users = participant_availability.get("label_users", {})
+        users: set
+        if "_label_" in statistic:
+            suffix = statistic.split("_label_", 1)[1]
+            raw_label = (
+                SLEEP_LABEL_MAP.get(suffix)
+                if type_name == "SleepAnalysis"
+                else {"momentary_limit": "MOMENTARY_LIMIT"}.get(suffix)
+            )
+            users = label_users.get((type_name, raw_label), set()) if raw_label else set()
+        elif "_any_" in statistic and type_name == "SleepAnalysis":
+            suffix = statistic.split("_any_", 1)[1]
+            categories = dict(SLEEP_ANY_GROUPS).get(suffix, ())
+            users = set()
+            for category in categories:
+                users |= set(label_users.get((type_name, category), set()))
+        else:
+            users = set(type_users.get(type_name, set()))
+        return wide_indexed["user_id"].isin(users).to_numpy(dtype=bool)
+
+    def apply_zero_fill_policy(
+        self,
+        wide: pd.DataFrame,
+        presence_frame: pd.DataFrame,
+        presence_by_type: Dict[str, pd.DataFrame],
+        participant_availability: Optional[Dict[str, Dict[Any, set]]] = None,
+    ) -> pd.DataFrame:
         """
-        Zero-fill selected stats under configurable gate conditions.
-        Gates provide policy; zero-fill eligibility is per-type/per-stat (registry).
+        Fill selected missing statistics when their gate and availability pass.
         """
         if wide.empty: return wide
         wide = wide.copy()
@@ -1525,6 +1824,16 @@ class HealthKitAggregator:
         ctx["watch_on"] = wide_idx["watch_on"].to_numpy()
         presence_maps: Dict[str, set] = {t: (set() if pres.empty else set(zip(pres["user_id"], pres["window_id"])))
                                         for t, pres in presence_by_type.items()}
+        if participant_availability is None:
+            type_users = {
+                type_name: set(presence["user_id"].dropna().tolist())
+                for type_name, presence in presence_by_type.items()
+                if presence is not None and not presence.empty
+            }
+            participant_availability = {
+                "type_users": type_users,
+                "label_users": {},
+            }
 
         for c in ["presence_any", "presence_non_watch", "source_active__watch", "source_active__phone", "source_active__other"]:
             if c in ctx.columns:
@@ -1534,21 +1843,27 @@ class HealthKitAggregator:
 
         fill_counts: Dict[str, int] = {}
 
-        for tname, eligible_stats, gate, fill_value in self._zero_fill_plan:
-            cols = [f"{tname}__{s}" for s in eligible_stats if f"{tname}__{s}" in wide.columns]
-            if not cols:
+        for tname, statistic, gate, fill_value, availability_policy in self._zero_fill_plan:
+            column = f"{tname}__{statistic}"
+            if column not in wide.columns:
                 continue
             gate_mask_ctx = self._compute_zero_fill_gate_mask(ctx, gate, presence_maps)
-            m_gate = pd.Series(np.asarray(gate_mask_ctx, dtype=bool), index=ctx.index).reindex(wide_idx.index).fillna(False).astype(bool).to_numpy()
-            if not bool(np.any(m_gate)):
-                for c in cols:
-                    fill_counts[c] = 0
+            m_gate = pd.Series(
+                np.asarray(gate_mask_ctx, dtype=bool), index=ctx.index
+            ).reindex(wide_idx.index).fillna(False).astype(bool).to_numpy()
+            m_available = self._availability_mask(
+                wide_idx,
+                tname,
+                statistic,
+                availability_policy,
+                participant_availability,
+            )
+            fill_mask = m_gate & m_available & wide[column].isna().to_numpy()
+            if not bool(np.any(fill_mask)):
+                fill_counts[column] = 0
                 continue
-
-            na_before = wide.loc[m_gate, cols].isna().sum()
-            wide.loc[m_gate, cols] = wide.loc[m_gate, cols].fillna(fill_value)
-            for c, n in na_before.items():
-                fill_counts[c] = int(n)
+            wide.loc[fill_mask, column] = fill_value
+            fill_counts[column] = int(fill_mask.sum())
 
         self.report["fills"]["counts_by_column"] = fill_counts
         return wide
@@ -1568,12 +1883,28 @@ class HealthKitAggregator:
     # ------------------------------------------------------------------------
     # QC Policy & Output Validation
     # ------------------------------------------------------------------------
+    @staticmethod
+    def _output_metadata_columns() -> set[str]:
+        """Return non-feature columns that QC masking must preserve."""
+        return {
+            "user_id", "window_id", "window_start", "window_end", "window_seconds",
+            "window_start_utc", "window_end_utc", "window_kind", "bin_index",
+            "bin_start", "bin_end", "bin_seconds", "assessment_id", "anchor_time",
+            "bin_in_lookback", "schedule_covered_seconds", "schedule_covered_fraction",
+            "window_start_local", "window_end_local", "local_date", "anchor_local_date",
+            "local_hour", "minute_of_day", "local_minute_index", "tz_name", "is_dst",
+            "fold", "utc_offset_seconds", "local_weekday", "iso_week", "sleep_date",
+            "wear_seconds", "wear_fraction", "watch_on", "presence_any",
+            "presence_non_watch", "source_active__watch", "source_active__phone",
+            "source_active__other",
+        }
+
     def _mask_selected_columns(self, df: pd.DataFrame, mask: pd.Series, selector: Dict[str, Any]) -> pd.DataFrame:
         """Apply NaN masking to selected columns (based on device class or types)."""
         if not mask.any(): return df
         df = df.copy()
         if selector.get("all", False):
-            keep = {"user_id","window_id","window_start","window_end","window_seconds","wear_seconds","wear_fraction","watch_on"}
+            keep = self._output_metadata_columns()
             cols = [c for c in df.columns if c not in keep]; df.loc[mask, cols] = np.nan; return df
 
         types_to_mask: List[str] = []
@@ -1638,7 +1969,7 @@ class HealthKitAggregator:
         # Remove empty rows
         pruned = 0
         if self.cfg.prune_empty_rows and not wide.empty:
-            keep = {"user_id","window_id","window_start","window_end","window_seconds","wear_seconds","wear_fraction","watch_on"}
+            keep = self._output_metadata_columns()
             data_cols = [c for c in wide.columns if c not in keep]
             all_nan = wide[data_cols].isna().all(axis=1) if data_cols else pd.Series(False, index=wide.index)
             pruned = int(all_nan.sum())
@@ -1661,7 +1992,14 @@ class HealthKitAggregator:
     # ------------------------------------------------------------------------
     # Primary Pipeline API
     # ------------------------------------------------------------------------
-    def run_aggregation(self, df: pd.DataFrame, schedule: Optional[pd.DataFrame] = None, assessments: Optional[pd.DataFrame] = None, duration_before: Optional[Any] = None) -> Tuple[pd.DataFrame, Dict[str, Any], Dict[str, pd.DataFrame]]:
+    def run_aggregation(
+        self,
+        df: pd.DataFrame,
+        schedule: Optional[pd.DataFrame] = None,
+        assessments: Optional[pd.DataFrame] = None,
+        assessment_window: Optional[AssessmentWindowSpec] = None,
+        include_daily_sleep: bool = False,
+    ) -> Tuple[pd.DataFrame, Dict[str, Any], Dict[str, pd.DataFrame]]:
         """
         Run the end-to-end aggregation pipeline (without QC masking/dropping).
 
@@ -1672,10 +2010,12 @@ class HealthKitAggregator:
         schedule : pd.DataFrame, optional
             Per-user timezone schedule. Inferred from df if not provided.
         assessments : pd.DataFrame, optional
-            Assessment timestamps for anchored windowing. If None, fixed-bin
-            windows are built instead.
-        duration_before : any, optional
-            Look-back duration passed to assessment-anchored window builder.
+            Rows containing user_id, assessment_id, and anchor_time. If None,
+            fixed-bin windows are built instead.
+        assessment_window : AssessmentWindowSpec, optional
+            Required with assessments; defines the lookback window layout.
+        include_daily_sleep : bool, default False
+            Compute daily sleep rows and merge them onto granular rows.
 
         Returns
         -------
@@ -1691,7 +2031,9 @@ class HealthKitAggregator:
         # --- 1. Initialize / validate input ----------------------------------
         # Reset report so each call is stateless with respect to prior runs.
         self.report = self._new_report()
+        self._last_daily_feature_names = []
         df = self.validate_and_normalize_input(df)
+        participant_availability = self.build_participant_availability(df)
         self.logger.info("Aggregation: %d input rows", len(df))
 
         # --- 2. Build time windows -------------------------------------------
@@ -1701,16 +2043,34 @@ class HealthKitAggregator:
 
         # Choose fixed-bin or assessment-anchored windowing.
         if assessments is None:
+            if assessment_window is not None:
+                raise ValueError("assessment_window requires assessments")
             windows, sch = self.build_bin_windows(df, schedule)
         else:
-            windows, sch = self.build_assessment_anchored_windows(assessments, schedule, duration_before=duration_before)
+            if assessment_window is None:
+                raise ValueError("assessments require assessment_window")
+            windows, sch = self.build_assessment_windows(
+                assessments, schedule, assessment_window
+            )
 
         # Guard: no windows means nothing to aggregate.
         if windows.empty:
             self.logger.warning("No windows generated; returning empty output")
-            wide = pd.DataFrame(columns=["user_id","window_id","window_start","window_end","window_seconds","wear_seconds","wear_fraction","watch_on","bin_index"])
+            wide = windows.copy()
+            for column in ("wear_seconds", "wear_fraction", "watch_on"):
+                wide[column] = pd.Series(dtype="float64" if column != "watch_on" else "boolean")
+            for feature in self._configured_granular_feature_names():
+                wide[feature] = pd.Series(dtype="float64")
             rep = self.build_aggregation_report(windows, wide, pd.DataFrame(), pd.DataFrame())
-            aux = {"windows": windows, "win_wear": pd.DataFrame(), "day_wear": pd.DataFrame(), "participant_wear": pd.DataFrame(), "presence": pd.DataFrame(), "schedule": sch}
+            aux = {
+                "windows": windows,
+                "win_wear": pd.DataFrame(),
+                "day_wear": pd.DataFrame(),
+                "participant_wear": pd.DataFrame(),
+                "presence": pd.DataFrame(),
+                "schedule": sch,
+                "daily_sleep": pd.DataFrame(),
+            }
             return wide, rep, aux
 
         self.logger.info("Built %d windows for %d users", len(windows), windows["user_id"].nunique())
@@ -1906,9 +2266,48 @@ class HealthKitAggregator:
 
         # --- 13. (Optional) Zero-fill ----------------------------------------
         if self.cfg.apply_zero_fill:
-            wide = self.apply_zero_fill_policy(wide, presence_frame, presence_by_type)
+            wide = self.apply_zero_fill_policy(
+                wide,
+                presence_frame,
+                presence_by_type,
+                participant_availability=participant_availability,
+            )
 
-        # --- 14. Finalize schema and return ----------------------------------
+        # --- 14. (Optional) Daily sleep --------------------------------------
+        daily_sleep = pd.DataFrame()
+        if include_daily_sleep:
+            daily_sleep = self.compute_daily_sleep_features(
+                df,
+                assessments=assessments,
+                schedule=sch,
+                qc=True,
+            )
+            local_starts = pd.to_datetime(
+                wide.get("window_start_local"), errors="coerce"
+            )
+            if local_starts.isna().any():
+                utc_fallback = pd.to_datetime(
+                    wide["window_start"], utc=True, errors="coerce"
+                ).dt.tz_localize(None)
+                local_starts = local_starts.where(local_starts.notna(), utc_fallback)
+            wide["sleep_date"] = (local_starts + pd.Timedelta(hours=9)).dt.date
+            merge_keys = ["user_id", "sleep_date"]
+            if assessments is not None:
+                merge_keys.insert(1, "assessment_id")
+            wide = wide.merge(daily_sleep, on=merge_keys, how="left", sort=False)
+            self._last_daily_feature_names = [
+                column for column in daily_sleep.columns
+                if column not in {"user_id", "assessment_id"}
+            ]
+            self.report["daily_sleep"] = {
+                "rows": int(len(daily_sleep)),
+                "feature_columns": [
+                    column for column in daily_sleep.columns
+                    if column not in {"user_id", "assessment_id", "sleep_date"}
+                ],
+            }
+
+        # --- 15. Finalize schema and return ----------------------------------
         wide = self._sanitize_output_schema(wide)
         wide = self._apply_output_timezone_policy(wide)
 
@@ -1916,7 +2315,9 @@ class HealthKitAggregator:
 
         self.logger.info("Aggregation complete: %d output rows", len(wide))
         return wide.sort_values(["user_id","window_start"]).reset_index(drop=True), rep, {
-            "windows": windows, "win_wear": win_wear, "day_wear": day_wear, "participant_wear": participant_wear, "presence": presence_frame, "schedule": sch
+            "windows": windows, "win_wear": win_wear, "day_wear": day_wear,
+            "participant_wear": participant_wear, "presence": presence_frame,
+            "schedule": sch, "daily_sleep": daily_sleep,
         }
 
     def apply_quality_control(self, wide: pd.DataFrame, aux: Dict[str, pd.DataFrame]) -> Tuple[pd.DataFrame, Dict[str, Any]]:
@@ -2221,293 +2622,302 @@ class HealthKitAggregator:
     # ------------------------------------------------------------------------
     # Extra: Daily Sleep Features
     # ------------------------------------------------------------------------
-    def compute_daily_sleep_features(self, hk_data: pd.DataFrame, qc: bool = True) -> pd.DataFrame:
-        """
-        Compute per-day sleep features from cleaned/normalized HealthKit data.
-        
-        Assumptions (already cleaned):
-        - SleepAnalysis labels are normalized (e.g., 'InBed','Asleep','Awake', 'AsleepCore', 'AsleepREM', 'AsleepDeep')
-        - Overlaps have been resolved for SleepAnalysis (categorical) rows
-        - HeartRate / HeartRateVariabilitySDNN / EnvironmentalAudioExposure values are numeric
-        - local_start/local_end exist (naive local datetimes), and user_id/type/value columns present
-
-        Returns
-        -------
-        pd.DataFrame with one row per (user_id, date).
-        """
-        if hk_data is None or hk_data.empty:
-            return pd.DataFrame(columns=["user_id", "date"])
-
-        # Different labels from watch/phone, labels for awake only occur if device thinks you're in bed (sleep data doesn't cover all times)
-        IN_BED_CATEGORIES = [
-            "InBed",
-            "Asleep",
-            "AsleepUnspecified",
-            "CategoryValueUnknown",
-            "Awake",
-            "AwakeUnspecified",
-            "AsleepCore",
-            "AsleepDeep",
-            "AsleepREM",
+    @staticmethod
+    def _daily_sleep_core_features() -> List[str]:
+        return [
+            "sleep_bedrest_duration_day",
+            "sleep_sleep_duration_day",
+            "sleep_awake_duration_day",
+            "sleep_wake_after_sleep_onset_day",
+            "sleep_sleep_onset_latency_day",
+            "sleep_efficiency_day",
+            "sleep_sleep_hr_median_day",
+            "sleep_sleep_hrv_median_day",
+            "sleep_bedrest_audio_median_day",
+            "sleep_first_bedrest_start_hours_day",
+            "sleep_last_bedrest_end_hours_day",
+            "sleep_first_onset_hours_day",
+            "sleep_last_offset_hours_day",
+            "sleep_day_elapsed_fraction",
         ]
-        ASLEEP_CATEGORIES = [
-            "Asleep",
-            "AsleepUnspecified",
-            "AwakeUnspecified", # Based on Samir looking at the data. It didn't show up often, but it mapped to time within sleep periods, often overlapping with asleep label.
-            "CategoryValueUnknown",
-            "AsleepCore",
-            "AsleepDeep",
-            "AsleepREM",
-        ]
-        AWAKE_CATEGORIES = {"Awake", "AwakeUnspecified"}
 
-        sleep_data = []
-        for uid, data in hk_data.groupby("user_id", sort=False):
-            # slice types we need
-            sleep_events = (
-                data.loc[data["type"] == "SleepAnalysis",
-                        ["local_start", "local_end", "value", "user_id", "type"]]
-                .copy()
-            )
-            if sleep_events.empty:
-                continue
+    @staticmethod
+    def _points_inside_intervals(
+        points: pd.DataFrame, intervals: pd.DataFrame
+    ) -> pd.Series:
+        if points.empty or intervals.empty:
+            return pd.Series(False, index=points.index)
+        timestamps = points["utc_start"]
+        inside = pd.Series(False, index=points.index)
+        for interval in intervals.itertuples(index=False):
+            inside |= (timestamps >= interval.utc_start) & (timestamps < interval.utc_end)
+        return inside
 
-            # label cleanup
-            sleep_events["value"] = (
-                sleep_events["value"].astype(str)
-                    .str.replace("HKCategoryValueSleepAnalysis", "", regex=False)
-            )
-            sleep_events["local_start"] = pd.to_datetime(sleep_events["local_start"], errors="coerce")
-            sleep_events["local_end"]   = pd.to_datetime(sleep_events["local_end"],   errors="coerce")
-            sleep_events = sleep_events.dropna(subset=["local_start","local_end"]).drop_duplicates().sort_values("local_start")
-            if sleep_events.empty:
-                continue
-
-            sleep_events["duration"] = sleep_events["local_end"] - sleep_events["local_start"]
-
-            heart_rate_samples   = data.loc[data["type"] == "HeartRate", ["local_start","value"]].copy()
-            hrv_sdnn_samples     = data.loc[data["type"] == "HeartRateVariabilitySDNN", ["local_start","value"]].copy()
-            audio_exposure_samples = data.loc[data["type"] == "EnvironmentalAudioExposure", ["local_start","value"]].copy()
-
-            # coerce numeric
-            for df_ in (heart_rate_samples, hrv_sdnn_samples, audio_exposure_samples):
-                if not df_.empty:
-                    df_["value"] = pd.to_numeric(df_["value"], errors="coerce")
-                    df_.dropna(subset=["value","local_start"], inplace=True)
-                    df_["local_start"] = pd.to_datetime(df_["local_start"], errors="coerce")
-                    df_.dropna(subset=["local_start"], inplace=True)
-
-            # day-bucketing anchor: 3pm local day anchor relative to first observed local_start
-            day_anchor_local = pd.to_datetime(sleep_events["local_start"].min()).replace(
-                hour=15, minute=0, second=0, microsecond=0
-            )
-
-            # handy masks
-            in_bed = sleep_events["value"].isin(IN_BED_CATEGORIES)
-            asleep = sleep_events["value"].isin(ASLEEP_CATEGORIES)
-            awake  = sleep_events["value"].isin(AWAKE_CATEGORIES)
-
-            # --- per-day aggregations (resample by local_start with origin=day_anchor_local) ---
-            bedrest_onset = (
-                sleep_events.loc[in_bed]
-                    .resample("1D", origin=day_anchor_local, on="local_start")["local_start"]
-                    .first()
-                    .rename("bedrest_onset")
-            )
-            bedrest_offset = (
-                sleep_events.loc[in_bed]
-                    .resample("1D", origin=day_anchor_local, on="local_start")["local_end"]
-                    .last()
-                    .rename("bedrest_offset")
-            )
-            bedrest_duration = (
-                sleep_events.loc[in_bed]
-                    .resample("1D", origin=day_anchor_local, on="local_start")["duration"]
-                    .sum()
-                    .rename("bedrest_duration")
-            )
-
-            sleep_onset = (
-                sleep_events.loc[asleep]
-                    .resample("1D", origin=day_anchor_local, on="local_start")["local_start"]
-                    .first()
-                    .rename("sleep_onset")
-            )
-            sleep_offset = (
-                sleep_events.loc[asleep]
-                    .resample("1D", origin=day_anchor_local, on="local_start")["local_end"]
-                    .last()
-                    .rename("sleep_offset")
-            )
-            sleep_duration = (
-                sleep_events.loc[asleep]
-                    .resample("1D", origin=day_anchor_local, on="local_start")["duration"]
-                    .sum()
-                    .rename("sleep_duration")
-            )
-
-            # first Awake period (to later compute WASO = total awake - first awake)
-            first_awake_segment = (
-                sleep_events.loc[awake]
-                    .resample("1D", origin=day_anchor_local, on="local_start")[["duration","local_start"]]
-                    .first()
-            )
-            # restrict first awake that falls between bedrest onset and sleep onset
-            first_awake_segment = pd.concat([first_awake_segment, bedrest_onset, sleep_onset], axis=1)
-            fa_mask = (first_awake_segment["local_start"] > first_awake_segment["bedrest_onset"]) & \
-                    (first_awake_segment["local_start"] < first_awake_segment["sleep_onset"])
-            first_awake_duration = first_awake_segment.loc[fa_mask, "duration"].rename("first_awake_duration")
-
-            awake_duration = (
-                sleep_events.loc[awake]
-                    .resample("1D", origin=day_anchor_local, on="local_start")["duration"]
-                    .sum()
-                    .rename("awake_duration")
-            )
-
-            # sleep category statistics
-            sleep_category_agg = (
-                sleep_events
-                    .groupby(
-                        ["value", pd.Grouper(key="local_start", freq="1D", origin=day_anchor_local)]
-                    )["duration"]
-                    .agg(sum="sum", mean="mean", count="count")
-                    .reset_index())
-
-            if not sleep_category_agg.empty:
-                sleep_category_agg = sleep_category_agg.pivot_table(
-                    index="local_start",
-                    columns="value",
-                    values=["sum", "mean", "count"],
-                    aggfunc="first",
-                )
-                sleep_category_agg = sleep_category_agg.swaplevel(0, 1, axis=1).sort_index(axis=1)
-                sleep_category_agg.columns = [
-                    "sleep_" + "_".join([str(col[0]), str(col[1])]).strip("_")
-                    for col in sleep_category_agg.columns
-                ]
-                duration_cols = [c for c in sleep_category_agg.columns if c.endswith("sum") or c.endswith("mean")]
-                for c in duration_cols:
-                    sleep_category_agg[c] = pd.to_timedelta(sleep_category_agg[c], errors="coerce") / pd.Timedelta("1h")
+    @staticmethod
+    def _prepare_daily_local_times(
+        hk_data: pd.DataFrame, schedule: Optional[pd.DataFrame]
+    ) -> pd.DataFrame:
+        """Ensure UTC and naive local timestamps are available for daily grouping."""
+        data = hk_data.copy()
+        data["utc_start"] = pd.to_datetime(data["utc_start"], utc=True, errors="coerce")
+        data["utc_end"] = pd.to_datetime(data["utc_end"], utc=True, errors="coerce")
+        for local_col in ("local_start", "local_end"):
+            if local_col not in data.columns:
+                data[local_col] = pd.NaT
             else:
-                sleep_category_agg = pd.DataFrame()
+                parsed = pd.to_datetime(data[local_col], errors="coerce")
+                if getattr(parsed.dt, "tz", None) is not None:
+                    parsed = parsed.dt.tz_localize(None)
+                data[local_col] = parsed
 
-            # assemble
-            sleep_agg = pd.concat(
-                [bedrest_onset, bedrest_offset, bedrest_duration,
-                sleep_onset, sleep_offset, sleep_duration,
-                first_awake_duration, awake_duration],
-                axis=1,
+        sch = schedule.copy() if schedule is not None else pd.DataFrame()
+        if not sch.empty:
+            sch["user_id"] = pd.to_numeric(sch["user_id"], errors="coerce")
+            sch["start_utc"] = pd.to_datetime(sch["start_utc"], utc=True, errors="coerce")
+            sch["end_utc"] = pd.to_datetime(sch["end_utc"], utc=True, errors="coerce")
+            for row in sch.dropna(subset=["user_id", "start_utc", "end_utc", "tz_name"]).itertuples(index=False):
+                for utc_col, local_col in (("utc_start", "local_start"), ("utc_end", "local_end")):
+                    timestamp = data[utc_col]
+                    mask = (
+                        data[local_col].isna()
+                        & data["user_id"].eq(row.user_id)
+                        & timestamp.ge(row.start_utc)
+                        & timestamp.le(row.end_utc)
+                    )
+                    if mask.any():
+                        converted = timestamp.loc[mask].dt.tz_convert(str(row.tz_name)).dt.tz_localize(None)
+                        data.loc[mask, local_col] = converted.to_numpy()
+
+        for utc_col, local_col in (("utc_start", "local_start"), ("utc_end", "local_end")):
+            missing = data[local_col].isna() & data[utc_col].notna()
+            if missing.any():
+                fallback = data.loc[missing, utc_col].dt.tz_convert("UTC").dt.tz_localize(None)
+                data.loc[missing, local_col] = fallback.to_numpy()
+        return data
+
+    @staticmethod
+    def _assessment_anchor_local(
+        user_id: Any,
+        anchor_time: pd.Timestamp,
+        schedule: Optional[pd.DataFrame],
+    ) -> pd.Timestamp:
+        if schedule is not None and not schedule.empty:
+            sch = schedule.copy()
+            sch["user_id"] = pd.to_numeric(sch["user_id"], errors="coerce")
+            sch = sch.loc[sch["user_id"] == user_id].copy()
+            sch["start_utc"] = pd.to_datetime(sch["start_utc"], utc=True, errors="coerce")
+            sch["end_utc"] = pd.to_datetime(sch["end_utc"], utc=True, errors="coerce")
+            match = sch.loc[
+                (sch["start_utc"] <= anchor_time) & (sch["end_utc"] >= anchor_time)
+            ]
+            if not match.empty:
+                return anchor_time.tz_convert(str(match.iloc[-1]["tz_name"])).tz_localize(None)
+        return anchor_time.tz_convert("UTC").tz_localize(None)
+
+    def compute_daily_sleep_features(
+        self,
+        hk_data: pd.DataFrame,
+        assessments: Optional[pd.DataFrame] = None,
+        schedule: Optional[pd.DataFrame] = None,
+        qc: bool = True,
+    ) -> pd.DataFrame:
+        """Compute whole-record 15:00-to-15:00 sleep features."""
+        keys = ["user_id", "sleep_date"]
+        if assessments is not None:
+            keys.insert(1, "assessment_id")
+        if hk_data is None or hk_data.empty:
+            return pd.DataFrame(columns=keys + self._daily_sleep_core_features())
+
+        data = self._prepare_daily_local_times(hk_data, schedule)
+        normalized_users, invalid_users = self._normalize_user_id_numeric(data["user_id"])
+        data = data.loc[~invalid_users].copy()
+        data["user_id"] = normalized_users.loc[data.index].astype("int64")
+        data = data.dropna(subset=["user_id", "utc_start", "utc_end"]).copy()
+        sleep_all = data.loc[data["type"] == "SleepAnalysis"].copy()
+        sleep_all["value"] = (
+            sleep_all["value"].astype(str)
+            .str.replace("HKCategoryValueSleepAnalysis", "", regex=False)
+        )
+        sleep_all = sleep_all.loc[
+            sleep_all["utc_end"] > sleep_all["utc_start"]
+        ].drop_duplicates().copy()
+        if sleep_all.empty:
+            return pd.DataFrame(columns=keys + self._daily_sleep_core_features())
+
+        canonical_labels = list(SLEEP_LABEL_MAP.values())
+        observed = set(sleep_all["value"].astype(str))
+        stage_labels = [label for label in canonical_labels if label in observed]
+        stage_labels += sorted(observed - set(stage_labels))
+        stage_features = [
+            f"sleep_{label}_{statistic}_day"
+            for label in stage_labels
+            for statistic in ("sum", "mean", "count")
+        ]
+
+        if assessments is None:
+            evaluations = pd.DataFrame(
+                {"user_id": data["user_id"].drop_duplicates().tolist()}
             )
-            if not sleep_category_agg.empty:
-                sleep_agg = sleep_agg.join(sleep_category_agg, how="left")
-            sleep_agg = sleep_agg.copy()
-            sleep_agg["first_awake_duration"] = sleep_agg["first_awake_duration"].fillna(pd.Timedelta(0))
-
-            # guardrail cleanup: keep bedrest bounds wrt sleep bounds when present
-            m = (sleep_agg["bedrest_onset"].notna() & sleep_agg["sleep_onset"].notna() &
-                (sleep_agg["bedrest_onset"] > sleep_agg["sleep_onset"]))
-            sleep_agg.loc[m, "bedrest_onset"] = sleep_agg.loc[m, "sleep_onset"]
-
-            m = (sleep_agg["bedrest_offset"].notna() & sleep_agg["sleep_offset"].notna() &
-                (sleep_agg["bedrest_offset"] < sleep_agg["sleep_offset"]))
-            sleep_agg.loc[m, "bedrest_offset"] = sleep_agg.loc[m, "sleep_offset"]
-
-            # contextual medians: HR/HRV during sleep; noise during bedrest
-            sleep_hr, sleep_hrv, bedrest_noise = [], [], []
-            for _, r in sleep_agg.iterrows():
-                # sleep intervals may be missing for some days
-                s_on, s_off = r.get("sleep_onset"), r.get("sleep_offset")
-                b_on, b_off = r.get("bedrest_onset"), r.get("bedrest_offset")
-
-                if not heart_rate_samples.empty and pd.notna(s_on) and pd.notna(s_off):
-                    sleep_hr.append(heart_rate_samples[(heart_rate_samples["local_start"] >= s_on) & (heart_rate_samples["local_start"] <= s_off)]["value"].median())
-                else:
-                    sleep_hr.append(np.nan)
-
-                if not hrv_sdnn_samples.empty and pd.notna(s_on) and pd.notna(s_off):
-                    sleep_hrv.append(hrv_sdnn_samples[(hrv_sdnn_samples["local_start"] >= s_on) & (hrv_sdnn_samples["local_start"] <= s_off)]["value"].median())
-                else:
-                    sleep_hrv.append(np.nan)
-
-                if not audio_exposure_samples.empty and pd.notna(b_on) and pd.notna(b_off):
-                    bedrest_noise.append(audio_exposure_samples[(audio_exposure_samples["local_start"] >= b_on) & (audio_exposure_samples["local_start"] <= b_off)]["value"].median())
-                else:
-                    bedrest_noise.append(np.nan)
-
-            sleep_agg["sleep_hr_median"] = sleep_hr
-            sleep_agg["sleep_hrv_median"] = sleep_hrv
-            sleep_agg["bedrest_audio_median"] = bedrest_noise
-
-            sleep_agg["sleep_onset_latency"] = (
-                (sleep_agg["sleep_onset"] - sleep_agg["bedrest_onset"]).to_numpy() / pd.Timedelta("1h")
+            evaluations["assessment_id"] = pd.NA
+            evaluations["anchor_time"] = pd.NaT
+        else:
+            required = {"user_id", "assessment_id", "anchor_time"}
+            missing = required - set(assessments.columns)
+            if missing:
+                raise ValueError(f"assessments missing required columns: {sorted(missing)}")
+            evaluations = assessments[["user_id", "assessment_id", "anchor_time"]].copy()
+            assessment_users, invalid_assessment_users = self._normalize_user_id_numeric(
+                evaluations["user_id"]
             )
-            wake_after_sleep_onset_td = sleep_agg["awake_duration"] - sleep_agg["first_awake_duration"]
+            if invalid_assessment_users.any():
+                raise ValueError("assessments.user_id must contain integer ids")
+            evaluations["user_id"] = assessment_users.astype("int64")
+            evaluations["anchor_time"] = pd.to_datetime(
+                evaluations["anchor_time"], utc=True, errors="coerce"
+            )
+            if evaluations[["user_id", "assessment_id", "anchor_time"]].isna().any().any():
+                raise ValueError("assessment identifiers and anchor_time must be nonmissing")
+            if evaluations.duplicated(["user_id", "assessment_id"]).any():
+                raise ValueError("(user_id, assessment_id) must be unique")
 
-            # convert timedeltas to hours
-            to_hours = lambda td: (td.to_numpy() / pd.Timedelta("1h")) if isinstance(td, pd.Series) else np.nan
-            sleep_agg["bedrest_duration"] = to_hours(sleep_agg["bedrest_duration"])
-            sleep_agg["sleep_duration"] = to_hours(sleep_agg["sleep_duration"])
-            sleep_agg["awake_duration"] = to_hours(sleep_agg["awake_duration"])
-            sleep_agg["wake_after_sleep_onset"] = wake_after_sleep_onset_td.to_numpy() / pd.Timedelta("1h")
+        rows: List[Dict[str, Any]] = []
+        for evaluation in evaluations.itertuples(index=False):
+            user_data = data.loc[data["user_id"] == evaluation.user_id].copy()
+            user_sleep = sleep_all.loc[sleep_all["user_id"] == evaluation.user_id].copy()
+            anchor = evaluation.anchor_time
+            has_cutoff = assessments is not None
+            if has_cutoff:
+                user_sleep = user_sleep.loc[user_sleep["utc_end"] <= anchor].copy()
+                user_data = user_data.loc[user_data["utc_start"] <= anchor].copy()
+            if user_sleep.empty:
+                continue
 
-            # efficiency
-            with np.errstate(divide="ignore", invalid="ignore"):
-                sleep_agg["efficiency"] = sleep_agg["sleep_duration"] / np.where(sleep_agg["bedrest_duration"] == 0, np.nan, sleep_agg["bedrest_duration"])
-            sleep_agg.loc[sleep_agg["efficiency"] > 1, "efficiency"] = 1
-            sleep_agg.loc[sleep_agg["efficiency"] == 0, "efficiency"] = np.nan
+            user_sleep["duration_hours"] = (
+                user_sleep["utc_end"] - user_sleep["utc_start"]
+            ).dt.total_seconds() / 3600.0
+            user_sleep["sleep_date"] = (
+                user_sleep["local_start"] + pd.Timedelta(hours=9)
+            ).dt.date
 
-            # clock-hour features relative to prior midnight (offset +15h because of 3pm anchor)
-            hours_offset = 15
-            idx = sleep_agg.index.tz_localize(None) if isinstance(sleep_agg.index, pd.DatetimeIndex) else pd.to_datetime(sleep_agg.index)
-            def _hours(col):
-                return hours_offset + ((sleep_agg[col] - idx) / pd.Timedelta("1h")).to_numpy()
-            for col, out in [("bedrest_onset","bedrest_onset_hours"),
-                            ("bedrest_offset","bedrest_offset_hours"),
-                            ("sleep_onset","sleep_onset_hours"),
-                            ("sleep_offset","sleep_offset_hours")]:
-                if col in sleep_agg.columns:
-                    sleep_agg[out] = _hours(col)
+            numeric_points: Dict[str, pd.DataFrame] = {}
+            for type_name in (
+                "HeartRate", "HeartRateVariabilitySDNN", "EnvironmentalAudioExposure"
+            ):
+                point_data = user_data.loc[
+                    user_data["type"] == type_name, ["utc_start", "value"]
+                ].copy()
+                point_data["value"] = pd.to_numeric(point_data["value"], errors="coerce")
+                numeric_points[type_name] = point_data.dropna(subset=["utc_start", "value"])
 
-            sleep_agg = sleep_agg.drop(
-                columns=[
-                    "bedrest_onset",
-                    "bedrest_offset",
-                    "sleep_onset",
-                    "sleep_offset",
-                    "first_awake_duration",
-                ],
-                errors="ignore",
+            anchor_local = (
+                self._assessment_anchor_local(
+                    evaluation.user_id, anchor, schedule
+                )
+                if has_cutoff else None
+            )
+            current_sleep_date = (
+                (anchor_local + pd.Timedelta(hours=9)).date()
+                if anchor_local is not None else None
             )
 
-            # drop timestamp cols; derive "date" as day after anchor (3pm)
-            sleep_agg = sleep_agg.reset_index().rename(columns={"index": "local_start"})
-            sleep_agg["date"] = (sleep_agg["local_start"] + pd.Timedelta("1D")).dt.date
-            sleep_agg = sleep_agg.drop(columns=["local_start"])
-            sleep_agg["user_id"] = uid
+            for sleep_date, day_events in user_sleep.groupby("sleep_date", sort=True):
+                day_events = day_events.sort_values(["local_start", "local_end"]).copy()
+                in_bed = day_events.loc[day_events["value"].isin(IN_BED_CATEGORIES)]
+                asleep = day_events.loc[day_events["value"].isin(ASLEEP_CATEGORIES)]
+                awake = day_events.loc[day_events["value"].isin(AWAKE_CATEGORIES)]
+                if in_bed.empty:
+                    continue
 
-            # rename with sleep_ prefix and _day suffix (without double-prefixing)
-            rename = {}
-            for c in sleep_agg.columns:
-                if c in ("user_id", "date"):
-                    rename[c] = c
-                elif c.startswith("sleep_"):
-                    # stage columns + "sleep_duration", "sleep_onset_latency", etc.
-                    rename[c] = f"{c}_day"
+                first_bedrest_start = in_bed.iloc[0]["local_start"]
+                last_bedrest_end = in_bed.iloc[-1]["local_end"]
+                first_sleep_onset = asleep.iloc[0]["local_start"] if not asleep.empty else pd.NaT
+                last_sleep_offset = asleep.iloc[-1]["local_end"] if not asleep.empty else pd.NaT
+                bedrest_duration = float(in_bed["duration_hours"].sum())
+                sleep_duration = float(asleep["duration_hours"].sum()) if not asleep.empty else 0.0
+                awake_duration = float(awake["duration_hours"].sum()) if not awake.empty else 0.0
+
+                waso = 0.0
+                if not asleep.empty and not awake.empty:
+                    qualifying_awake = awake.loc[
+                        (awake["local_start"] >= first_sleep_onset)
+                        & (awake["local_end"] <= last_sleep_offset)
+                    ]
+                    waso = float(qualifying_awake["duration_hours"].sum())
+
+                def _context_median(type_name: str, intervals: pd.DataFrame) -> float:
+                    points = numeric_points[type_name]
+                    mask = self._points_inside_intervals(points, intervals)
+                    return float(points.loc[mask, "value"].median()) if mask.any() else np.nan
+
+                day_start = pd.Timestamp(sleep_date) - pd.Timedelta(days=1) + pd.Timedelta(hours=15)
+                def _clock_hours(timestamp: Any) -> float:
+                    if pd.isna(timestamp):
+                        return np.nan
+                    return float(15.0 + (timestamp - day_start) / pd.Timedelta(hours=1))
+
+                if has_cutoff:
+                    if sleep_date < current_sleep_date:
+                        elapsed_fraction = 1.0
+                    elif sleep_date == current_sleep_date:
+                        elapsed_fraction = float(np.clip(
+                            (anchor_local - day_start) / pd.Timedelta(days=1), 0.0, 1.0
+                        ))
+                    else:
+                        elapsed_fraction = 0.0
                 else:
-                    rename[c] = f"sleep_{c}_day"
+                    elapsed_fraction = 1.0
 
-            sleep_agg = sleep_agg.rename(columns=rename)
-            sleep_data.append(sleep_agg)
+                row: Dict[str, Any] = {
+                    "user_id": evaluation.user_id,
+                    "sleep_date": sleep_date,
+                    "sleep_bedrest_duration_day": bedrest_duration,
+                    "sleep_sleep_duration_day": sleep_duration,
+                    "sleep_awake_duration_day": awake_duration,
+                    "sleep_wake_after_sleep_onset_day": waso,
+                    "sleep_sleep_onset_latency_day": (
+                        float((first_sleep_onset - first_bedrest_start) / pd.Timedelta(hours=1))
+                        if pd.notna(first_sleep_onset) else np.nan
+                    ),
+                    "sleep_efficiency_day": (
+                        sleep_duration / bedrest_duration if bedrest_duration else np.nan
+                    ),
+                    "sleep_sleep_hr_median_day": _context_median("HeartRate", asleep),
+                    "sleep_sleep_hrv_median_day": _context_median(
+                        "HeartRateVariabilitySDNN", asleep
+                    ),
+                    "sleep_bedrest_audio_median_day": _context_median(
+                        "EnvironmentalAudioExposure", in_bed
+                    ),
+                    "sleep_first_bedrest_start_hours_day": _clock_hours(first_bedrest_start),
+                    "sleep_last_bedrest_end_hours_day": _clock_hours(last_bedrest_end),
+                    "sleep_first_onset_hours_day": _clock_hours(first_sleep_onset),
+                    "sleep_last_offset_hours_day": _clock_hours(last_sleep_offset),
+                    "sleep_day_elapsed_fraction": elapsed_fraction,
+                }
+                if has_cutoff:
+                    row["assessment_id"] = evaluation.assessment_id
+                for label in stage_labels:
+                    label_events = day_events.loc[day_events["value"] == label]
+                    durations = label_events["duration_hours"]
+                    row[f"sleep_{label}_sum_day"] = (
+                        float(durations.sum()) if not label_events.empty else np.nan
+                    )
+                    row[f"sleep_{label}_mean_day"] = (
+                        float(durations.mean()) if not label_events.empty else np.nan
+                    )
+                    row[f"sleep_{label}_count_day"] = (
+                        float(len(label_events)) if not label_events.empty else np.nan
+                    )
+                rows.append(row)
 
-        if not sleep_data:
-            return pd.DataFrame(columns=["user_id", "date"])
-
-        out = pd.concat(sleep_data, ignore_index=True)
-
+        output_columns = keys + self._daily_sleep_core_features() + stage_features
+        if not rows:
+            return pd.DataFrame(columns=output_columns)
+        out = pd.DataFrame(rows)
+        out = out.reindex(columns=output_columns)
         if qc:
             out = self.apply_sleep_quality_control(out)
-        return out
+        return out.sort_values(keys).reset_index(drop=True)
 
     def apply_sleep_quality_control(self, data: pd.DataFrame) -> pd.DataFrame:
         if data is None or data.empty:

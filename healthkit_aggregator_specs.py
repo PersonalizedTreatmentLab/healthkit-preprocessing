@@ -33,7 +33,127 @@ import pandas as pd
 # ============================================================================
 # Default HK Type Registry Builder
 # ============================================================================
-def build_default_type_registry() -> Dict[str, Dict[str, Any]]:
+SLEEP_LABEL_SUFFIXES = (
+    "in_bed",
+    "asleep",
+    "asleep_unspecified",
+    "asleep_core",
+    "asleep_deep",
+    "asleep_rem",
+    "awake",
+    "awake_unspecified",
+    "sleep_unknown",
+)
+SLEEP_UNION_SUFFIXES = ("in_bed", "asleep", "awake")
+SLEEP_WINDOW_STATISTICS = (
+    "sum",
+    "mean",
+    "count",
+    "continues_from_previous_bin",
+    "continues_into_next_bin",
+)
+
+
+@dataclass(frozen=True)
+class SleepFeatureSpec:
+    """Select granular sleep labels, unions, and window statistics."""
+
+    labels: tuple[str, ...] = SLEEP_LABEL_SUFFIXES
+    unions: tuple[str, ...] = SLEEP_UNION_SUFFIXES
+    statistics: tuple[str, ...] = SLEEP_WINDOW_STATISTICS
+
+    def validate(self) -> None:
+        selections = (
+            ("labels", self.labels, SLEEP_LABEL_SUFFIXES),
+            ("unions", self.unions, SLEEP_UNION_SUFFIXES),
+            ("statistics", self.statistics, SLEEP_WINDOW_STATISTICS),
+        )
+        for name, values, allowed in selections:
+            unknown = sorted(set(values) - set(allowed))
+            if unknown:
+                raise ValueError(f"SleepFeatureSpec.{name} contains unsupported value(s): {unknown}")
+            if len(values) != len(set(values)):
+                raise ValueError(f"SleepFeatureSpec.{name} must not contain duplicates")
+
+    def aggregate_names(self) -> tuple[str, ...]:
+        self.validate()
+        label_features = tuple(
+            f"{stat}_label_{label}"
+            for label in self.labels
+            for stat in self.statistics
+        )
+        union_features = tuple(
+            f"{stat}_any_{union}"
+            for union in self.unions
+            for stat in self.statistics
+        )
+        return label_features + union_features
+
+
+@dataclass(frozen=True)
+class AssessmentWindowSpec:
+    """Define how lookback windows are constructed for each assessment."""
+
+    mode: Literal["whole_lookback", "split_lookback", "aligned_grid"]
+    duration_before: Optional[Any] = None
+    n_bins: Optional[int] = None
+    bin_size: Optional[Any] = None
+    bin_origin: Optional[Any] = None
+    tz_mode: Optional[Literal["utc", "local"]] = None
+
+    def validate(self) -> None:
+        if self.mode not in {"whole_lookback", "split_lookback", "aligned_grid"}:
+            raise ValueError(
+                "AssessmentWindowSpec.mode must be 'whole_lookback', "
+                "'split_lookback', or 'aligned_grid'"
+            )
+
+        populated = {
+            name
+            for name in ("duration_before", "n_bins", "bin_size", "bin_origin", "tz_mode")
+            if getattr(self, name) is not None
+        }
+        required = {
+            "whole_lookback": {"duration_before"},
+            "split_lookback": {"duration_before", "n_bins"},
+            "aligned_grid": {"n_bins", "bin_size"},
+        }[self.mode]
+        allowed = {
+            "whole_lookback": {"duration_before"},
+            "split_lookback": {"duration_before", "n_bins"},
+            "aligned_grid": {"n_bins", "bin_size", "bin_origin", "tz_mode"},
+        }[self.mode]
+        missing = required - populated
+        irrelevant = populated - allowed
+        if missing or irrelevant:
+            raise ValueError(
+                f"AssessmentWindowSpec(mode={self.mode!r}) has "
+                f"missing={sorted(missing)} irrelevant={sorted(irrelevant)}"
+            )
+
+        if self.duration_before is not None:
+            duration = pd.to_timedelta(self.duration_before)
+            if pd.isna(duration) or duration <= pd.Timedelta(0):
+                raise ValueError("duration_before must be a positive duration")
+        if self.n_bins is not None:
+            if isinstance(self.n_bins, bool) or int(self.n_bins) != self.n_bins or int(self.n_bins) < 1:
+                raise ValueError("n_bins must be a positive integer")
+        if self.bin_size is not None:
+            bin_size = pd.to_timedelta(self.bin_size)
+            seconds = bin_size.total_seconds()
+            if pd.isna(bin_size) or seconds < 1 or not float(seconds).is_integer():
+                raise ValueError("bin_size must be a fixed duration in whole seconds")
+        if self.bin_origin is not None:
+            origin = pd.to_timedelta(self.bin_origin)
+            if pd.isna(origin) or origin < pd.Timedelta(0) or origin >= pd.Timedelta(days=1):
+                raise ValueError("bin_origin must be within [00:00:00, 24:00:00)")
+        if self.tz_mode is not None and self.tz_mode not in {"utc", "local"}:
+            raise ValueError("tz_mode must be 'utc' or 'local'")
+
+
+def build_default_type_registry(
+    sleep_features: Optional[SleepFeatureSpec] = None,
+) -> Dict[str, Dict[str, Any]]:
     """
     Build the default HealthKit type registry.
 
@@ -54,12 +174,23 @@ def build_default_type_registry() -> Dict[str, Dict[str, Any]]:
     #                        One of: "interval_total", "interval_level", "point", "categorical_interval"
     #   aggregates         — Tuple of stat names to compute. Each produces a column: <type>__<stat>
     #   device_class       — Which device sources are valid: "either", "watch_exclusive", "non_watch_exclusive"
-    #   zero_fill_gate     — When to fill missing windows with zeros.
-    #                        ("watch_on", {}) = fill when watch was worn; ("expr_false", {}) = never fill
-    #   zero_fill_stats    — Set of stat names eligible for zero-fill (optional; omit to skip)
+    #   zero_fill_rules    — Per-stat rules with gate, fill value, and participant
+    #                        availability policy (optional; omit to leave missing)
     #   special_aggregates — Dict of custom aggregation specs (optional). See interval_level examples.
 
     reg: Dict[str, Dict[str, Any]] = {}
+    sleep_features = sleep_features or SleepFeatureSpec()
+    sleep_aggregates = sleep_features.aggregate_names()
+
+    def _participant_zero_rules(statistics: tuple[str, ...]) -> Dict[str, Dict[str, Any]]:
+        return {
+            statistic: {
+                "gate": ("watch_on", {}),
+                "fill_value": 0.0,
+                "availability": "participant_evidence",
+            }
+            for statistic in statistics
+        }
 
     # -----------------------------------------------------------------------
     # INTERVAL TOTAL — Cumulative measures recorded over time intervals
@@ -76,61 +207,53 @@ def build_default_type_registry() -> Dict[str, Dict[str, Any]]:
 
     reg["StepCount"] = {
         "time_behavior": "interval_total",
-        "aggregates": ("sum", "duration", "rate_per_min"),
+        "aggregates": ("sum", "duration", "rate_per_min", "continues_from_previous_bin", "continues_into_next_bin"),
         "device_class": "either",
-        "zero_fill_gate": ("watch_on", {}),
-        "zero_fill_stats": {"sum", "duration", "rate_per_min"},
+        "zero_fill_rules": _participant_zero_rules(("sum", "duration", "rate_per_min", "continues_from_previous_bin", "continues_into_next_bin")),
     }
     reg["DistanceCycling"] = {
         "time_behavior": "interval_total",
-        "aggregates": ("sum", "duration", "rate_per_min"),
+        "aggregates": ("sum", "duration", "rate_per_min", "continues_from_previous_bin", "continues_into_next_bin"),
         "device_class": "either",
-        "zero_fill_gate": ("watch_on", {}),
-        "zero_fill_stats": {"sum", "duration", "rate_per_min"},
+        "zero_fill_rules": _participant_zero_rules(("sum", "duration", "rate_per_min", "continues_from_previous_bin", "continues_into_next_bin")),
     }
     reg["DistanceWalkingRunning"] = {
         "time_behavior": "interval_total",
-        "aggregates": ("sum", "duration", "rate_per_min"),
+        "aggregates": ("sum", "duration", "rate_per_min", "continues_from_previous_bin", "continues_into_next_bin"),
         "device_class": "either",
-        "zero_fill_gate": ("watch_on", {}),
-        "zero_fill_stats": {"sum", "duration", "rate_per_min"},
+        "zero_fill_rules": _participant_zero_rules(("sum", "duration", "rate_per_min", "continues_from_previous_bin", "continues_into_next_bin")),
     }
     reg["FlightsClimbed"] = {
         "time_behavior": "interval_total",
-        "aggregates": ("sum", "duration", "rate_per_min"),
+        "aggregates": ("sum", "duration", "rate_per_min", "continues_from_previous_bin", "continues_into_next_bin"),
         "device_class": "either",
-        "zero_fill_gate": ("watch_on", {}),
-        "zero_fill_stats": {"sum", "duration", "rate_per_min"},
+        "zero_fill_rules": _participant_zero_rules(("sum", "duration", "rate_per_min", "continues_from_previous_bin", "continues_into_next_bin")),
     }
     reg["ActiveEnergyBurned"] = {
         "time_behavior": "interval_total",
-        "aggregates": ("sum", "duration", "rate_per_min"),
+        "aggregates": ("sum", "duration", "rate_per_min", "continues_from_previous_bin", "continues_into_next_bin"),
         "device_class": "either",
-        "zero_fill_gate": ("watch_on", {}),
-        "zero_fill_stats": {"sum", "duration", "rate_per_min"},
+        "zero_fill_rules": _participant_zero_rules(("sum", "duration", "rate_per_min", "continues_from_previous_bin", "continues_into_next_bin")),
     }
     reg["BasalEnergyBurned"] = {
         "time_behavior": "interval_total",
-        "aggregates": ("sum", "duration", "rate_per_min"),
+        "aggregates": ("sum", "duration", "rate_per_min", "continues_from_previous_bin", "continues_into_next_bin"),
         "device_class": "either",
-        "zero_fill_gate": ("watch_on", {}),
-        "zero_fill_stats": {"sum", "duration", "rate_per_min"},
+        "zero_fill_rules": _participant_zero_rules(("sum", "duration", "rate_per_min", "continues_from_previous_bin", "continues_into_next_bin")),
     }
 
     # interval_total — duration-only types (no rate needed)
     reg["AppleExerciseTime"] = {
         "time_behavior": "interval_total",
-        "aggregates": ("sum",),
+        "aggregates": ("sum", "continues_from_previous_bin", "continues_into_next_bin"),
         "device_class": "either",
-        "zero_fill_gate": ("watch_on", {}),
-        "zero_fill_stats": {"sum"},
+        "zero_fill_rules": _participant_zero_rules(("sum", "continues_from_previous_bin", "continues_into_next_bin")),
     }
     reg["AppleStandTime"] = {
         "time_behavior": "interval_total",
-        "aggregates": ("sum",),
+        "aggregates": ("sum", "continues_from_previous_bin", "continues_into_next_bin"),
         "device_class": "either",
-        "zero_fill_gate": ("watch_on", {}),
-        "zero_fill_stats": {"sum"},
+        "zero_fill_rules": _participant_zero_rules(("sum", "continues_from_previous_bin", "continues_into_next_bin")),
     }
 
     # -----------------------------------------------------------------------
@@ -148,9 +271,8 @@ def build_default_type_registry() -> Dict[str, Dict[str, Any]]:
     reg["EnvironmentalAudioExposure"] = {
         "time_behavior": "interval_level",
         "aggregates": ("leq", "energy_seconds", "time_weighted_mean", "max", "duration",
-                       "median", "median_duration", "count"),
+                       "median", "median_duration", "count", "continues_from_previous_bin", "continues_into_next_bin"),
         "device_class": "either",
-        "zero_fill_gate": ("expr_false", {}),
         "special_aggregates": {
             "p95": {"op": "weighted_quantile", "q": 0.95},
             "time_above_85": {"op": "time_above", "threshold": 85.0},
@@ -159,9 +281,8 @@ def build_default_type_registry() -> Dict[str, Dict[str, Any]]:
     reg["HeadphoneAudioExposure"] = {
         "time_behavior": "interval_level",
         "aggregates": ("leq", "energy_seconds", "time_weighted_mean", "max", "duration",
-                       "median", "median_duration", "count"),
+                       "median", "median_duration", "count", "continues_from_previous_bin", "continues_into_next_bin"),
         "device_class": "non_watch_exclusive",
-        "zero_fill_gate": ("expr_false", {}),
         "special_aggregates": {
             "p95": {"op": "weighted_quantile", "q": 0.95},
             "time_above_85": {"op": "time_above", "threshold": 85.0},
@@ -182,13 +303,11 @@ def build_default_type_registry() -> Dict[str, Dict[str, Any]]:
         "time_behavior": "point",
         "aggregates": ("mean", "median", "std", "max", "min", "count"),
         "device_class": "watch_exclusive",
-        "zero_fill_gate": ("watch_on", {}),
     }
     reg["HeartRateVariabilitySDNN"] = {
         "time_behavior": "point",
         "aggregates": ("mean", "median", "std", "max", "min", "count"),
         "device_class": "watch_exclusive",
-        "zero_fill_gate": ("watch_on", {}),
         "special_aggregates": {
             "p75": {"op": "quantile", "q": 0.75},
         },
@@ -197,13 +316,11 @@ def build_default_type_registry() -> Dict[str, Dict[str, Any]]:
         "time_behavior": "point",
         "aggregates": ("mean", "median", "std", "max", "min", "count"),
         "device_class": "watch_exclusive",
-        "zero_fill_gate": ("watch_on", {}),
     }
     reg["OxygenSaturation"] = {
         "time_behavior": "point",
         "aggregates": ("mean", "median", "std", "max", "min", "count"),
         "device_class": "watch_exclusive",
-        "zero_fill_gate": ("watch_on", {}),
         "special_aggregates": {
             "pct_below_92": {"op": "pct_below", "threshold": 92.0},
         },
@@ -213,14 +330,16 @@ def build_default_type_registry() -> Dict[str, Dict[str, Any]]:
     # CATEGORICAL INTERVAL — Labeled time intervals
     # -----------------------------------------------------------------------
     # Values are category labels across time intervals (e.g., sleep stages).
-    # The pipeline tracks duration, count, and boundary timestamps for each label.
+    # The pipeline tracks duration, count, and strict boundary continuity.
     #
     # Aggregate naming pattern:
     #   sum_label_<label>   — total seconds with that label in the window
     #   mean_label_<label>  — mean bout duration (seconds) for that label
     #   count_label_<label> — number of bouts with that label
-    #   start_label_<label> — earliest start time with that label
-    #   end_label_<label>   — latest end time with that label
+    #   continues_from_previous_bin_label_<label> — original interval crosses
+    #                                                the window-start boundary
+    #   continues_into_next_bin_label_<label>     — original interval crosses
+    #                                                the window-end boundary
 
     reg["EnvironmentalAudioExposureEvent"] = {
         "time_behavior": "categorical_interval",
@@ -228,33 +347,23 @@ def build_default_type_registry() -> Dict[str, Dict[str, Any]]:
             "sum_label_momentary_limit",
             "mean_label_momentary_limit",
             "count_label_momentary_limit",
+            "continues_from_previous_bin_label_momentary_limit",
+            "continues_into_next_bin_label_momentary_limit",
         ),
         "device_class": "either",
-        "zero_fill_gate": ("watch_on", {}),
-        "zero_fill_stats": {
+        "zero_fill_rules": _participant_zero_rules((
             "sum_label_momentary_limit",
             "mean_label_momentary_limit",
             "count_label_momentary_limit",
-        },
+            "continues_from_previous_bin_label_momentary_limit",
+            "continues_into_next_bin_label_momentary_limit",
+        )),
     }
     reg["SleepAnalysis"] = {
         "time_behavior": "categorical_interval",
-        "aggregates": (
-            "sum_label_in_bed", "mean_label_in_bed", "count_label_in_bed",
-            "sum_label_asleep", "mean_label_asleep", "count_label_asleep",
-            "sum_label_awake", "mean_label_awake", "count_label_awake",
-            "sum_label_sleep_unknown", "mean_label_sleep_unknown", "count_label_sleep_unknown",
-            "start_label_in_bed", "start_label_asleep", "start_label_awake", "start_label_sleep_unknown",
-            "end_label_in_bed", "end_label_asleep", "end_label_awake", "end_label_sleep_unknown",
-        ),
+        "aggregates": sleep_aggregates,
         "device_class": "either",
-        "zero_fill_gate": ("watch_on", {}),
-        "zero_fill_stats": {
-            "sum_label_in_bed", "mean_label_in_bed", "count_label_in_bed",
-            "sum_label_asleep", "mean_label_asleep", "count_label_asleep",
-            "sum_label_awake", "mean_label_awake", "count_label_awake",
-            "sum_label_sleep_unknown", "mean_label_sleep_unknown", "count_label_sleep_unknown",
-        },
+        "zero_fill_rules": _participant_zero_rules(sleep_aggregates),
     }
 
     return reg
@@ -271,7 +380,6 @@ class HKAggConfig:
     bin_origin: str = "00:00:00"       # Time-of-day that windows align to (e.g., "00:00:00" = midnight)
     tz_mode_l0: Literal["utc", "local"] = "utc"  # "utc" bins by UTC timestamps; "local" bins by local time
     output_timezone: Literal["UTC", "local", "both"] = "both"  # Which timestamps appear in output columns
-    assessment_duration_before: Optional[str] = None  # For assessment-anchored windows (e.g., "7D" = 7 days before)
 
     # --- Schedule (advanced) ---
     # These control timezone schedule inference. Defaults work for most research workflows.
@@ -314,7 +422,7 @@ class HKAggConfig:
     type_registry: Dict[str, Dict[str, Any]] = field(default_factory=build_default_type_registry)
 
     # --- Zero Fill ---
-    # If True, fill missing-but-expected observations with zeros when the zero_fill_gate condition is met.
+    # If True, apply each configured statistic's gate and availability rule.
     apply_zero_fill: bool = False
     apply_sleep_qc_fill_nan: bool = False        # Fill missing daily sleep stage/category aggregates with zeros when sleep duration is present
 
@@ -339,8 +447,65 @@ class HKAggConfig:
         """Light config validation; raise early for schema errors."""
         if hasattr(self, "tz_mode_10"):
             raise ValueError("Use `tz_mode_l0` (letter l + zero), not `tz_mode_10`.")
+        bin_duration = pd.to_timedelta(self.bin_size)
+        bin_seconds = bin_duration.total_seconds()
+        if pd.isna(bin_duration) or bin_seconds < 1 or not float(bin_seconds).is_integer():
+            raise ValueError("bin_size must be a fixed duration in whole seconds")
+        origin = pd.to_timedelta(self.bin_origin)
+        if pd.isna(origin) or origin < pd.Timedelta(0) or origin >= pd.Timedelta(days=1):
+            raise ValueError("bin_origin must be within [00:00:00, 24:00:00)")
         for t, meta in self.type_registry.items():
             if "time_behavior" not in meta: raise ValueError(f"type_registry entry '{t}' missing 'time_behavior'")
+            rules = meta.get("zero_fill_rules", {})
+            if not isinstance(rules, dict):
+                raise ValueError(f"type_registry entry '{t}' zero_fill_rules must be a mapping")
+            configured = set(meta.get("aggregates", ()))
+            for statistic, rule in rules.items():
+                if statistic not in configured:
+                    raise ValueError(
+                        f"type_registry entry '{t}' has a zero-fill rule for unconfigured statistic '{statistic}'"
+                    )
+                if not isinstance(rule, dict):
+                    raise ValueError(f"zero-fill rule '{t}__{statistic}' must be a mapping")
+                unknown = set(rule) - {"gate", "fill_value", "availability"}
+                missing = {"gate", "fill_value", "availability"} - set(rule)
+                if unknown or missing:
+                    raise ValueError(
+                        f"zero-fill rule '{t}__{statistic}' has unknown={sorted(unknown)} missing={sorted(missing)}"
+                    )
+                gate = rule["gate"]
+                if not (
+                    isinstance(gate, tuple)
+                    and len(gate) == 2
+                    and isinstance(gate[0], str)
+                    and isinstance(gate[1], dict)
+                ):
+                    raise ValueError(
+                        f"zero-fill rule '{t}__{statistic}' gate must be a (name, parameters) tuple"
+                    )
+                supported_gates = {
+                    "expr_false", "watch_on", "source_present",
+                    "any_source_present", "any_non_watch_present", "presence_types",
+                }
+                if gate[0] not in supported_gates:
+                    raise ValueError(
+                        f"zero-fill rule '{t}__{statistic}' has unsupported gate '{gate[0]}'"
+                    )
+                try:
+                    fill_value = float(rule["fill_value"])
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"zero-fill rule '{t}__{statistic}' fill_value must be numeric"
+                    ) from exc
+                if not np.isfinite(fill_value):
+                    raise ValueError(
+                        f"zero-fill rule '{t}__{statistic}' fill_value must be finite"
+                    )
+                if rule["availability"] not in {"participant_evidence", "assume_available"}:
+                    raise ValueError(
+                        f"zero-fill rule '{t}__{statistic}' availability must be "
+                        "'participant_evidence' or 'assume_available'"
+                    )
         if self.qc_action not in {"drop","mask"}: raise ValueError("qc_action must be 'drop' or 'mask'")
         if self.tz_mode_l0 not in {"utc","local"}: raise ValueError("tz_mode_l0 must be one of {'utc','local'}")
         if self.tz_policy not in {"strict","lenient"}: raise ValueError("tz_policy must be one of {'strict','lenient'}")

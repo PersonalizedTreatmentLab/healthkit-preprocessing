@@ -10,7 +10,8 @@ Modify this file to:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Set, Literal
+import math
+from typing import Any, Dict, Set
 
 
 # ===================================================
@@ -37,43 +38,66 @@ class HKCleanConfig:
     # =========================
     # Plausibility thresholds
     # =========================
-    # Observations with values outside these ranges are dropped (when apply_theory_thresholds is True).
-    # Format: "TypeName": {"min": lower_bound, "max": upper_bound}
-    #   - Omit "max" to allow any upper value.
-    #   - "kcal_per_min_max" is a special key for energy types only (see kcal_per_min_policy below).
+    # Each configured check has its own limit and action. Omitted checks are not applied.
+    # Format: "TypeName": {"min"|"max"|"rate_per_min_max": {"limit": number, "action": "cap"|"drop"}}
     #
     # Units: HeartRate (bpm), HeartRateVariabilitySDNN (seconds), OxygenSaturation (fraction 0-1),
     #        RespiratoryRate (breaths/min), Audio types (dB), Activity types (native HealthKit units).
-    thresholds: Dict[str, Dict[str, float]] = field(default_factory=lambda: {
+    thresholds: Dict[str, Dict[str, Dict[str, Any]]] = field(default_factory=lambda: {
         # Audio (dB)
-        "EnvironmentalAudioExposure": {"min": 0},
-        "HeadphoneAudioExposure": {"min": 0},
+        "EnvironmentalAudioExposure": {"min": {"limit": 0, "action": "drop"}},
+        "HeadphoneAudioExposure": {"min": {"limit": 0, "action": "drop"}},
 
         # Activity (counts, minutes, kcal, meters, flights)
-        "StepCount": {"min": 0},
-        "AppleExerciseTime": {"min": 0},
-        "ActiveEnergyBurned": {"min": 0, "kcal_per_min_max": 30},
-        "BasalEnergyBurned": {"min": 0, "kcal_per_min_max": 30},
-        "AppleStandTime": {"min": 0},
-        "DistanceCycling": {"min": 0},
-        "DistanceWalkingRunning": {"min": 0},
-        "FlightsClimbed": {"min": 0},
+        "StepCount": {
+            "min": {"limit": 0, "action": "drop"},
+            "rate_per_min_max": {"limit": 350, "action": "cap"},
+        },
+        "AppleExerciseTime": {"min": {"limit": 0, "action": "drop"}},
+        "ActiveEnergyBurned": {
+            "min": {"limit": 0, "action": "drop"},
+            "rate_per_min_max": {"limit": 30, "action": "cap"},
+        },
+        "BasalEnergyBurned": {
+            "min": {"limit": 0, "action": "drop"},
+            "rate_per_min_max": {"limit": 10, "action": "cap"},
+        },
+        "AppleStandTime": {"min": {"limit": 0, "action": "drop"}},
+        "DistanceCycling": {
+            "min": {"limit": 0, "action": "drop"},
+            "rate_per_min_max": {"limit": 2000, "action": "cap"},
+        },
+        "DistanceWalkingRunning": {
+            "min": {"limit": 0, "action": "drop"},
+            "rate_per_min_max": {"limit": 750, "action": "cap"},
+        },
+        "FlightsClimbed": {
+            "min": {"limit": 0, "action": "drop"},
+            "max": {"limit": 8000, "action": "drop"},
+        },
 
         # Vitals
-        "HeartRate": {"min": 30, "max": 230},                  # bpm
-        "HeartRateVariabilitySDNN": {"min": 0, "max": 1},      # seconds
-        "RespiratoryRate": {"min": 0.1, "max": 100},              # breaths/min
-        "OxygenSaturation": {"min": 0.50, "max": 1.0},         # fraction
+        "HeartRate": {
+            "min": {"limit": 25, "action": "drop"},
+            "max": {"limit": 240, "action": "drop"},
+        },
+        "HeartRateVariabilitySDNN": {
+            "min": {"limit": 0, "action": "drop"},
+            "max": {"limit": 1, "action": "drop"},
+        },
+        "RespiratoryRate": {
+            "min": {"limit": 0.1, "action": "drop"},
+            "max": {"limit": 100, "action": "drop"},
+        },
+        "OxygenSaturation": {
+            "min": {"limit": 0.50, "action": "drop"},
+            "max": {"limit": 1.0, "action": "drop"},
+        },
     })
 
     # =========================
     # Behavioral options
     # =========================
-    # When energy burn rate exceeds kcal_per_min_max:
-    #   "cap"  — clamp the value at the threshold
-    #   "drop" — remove the observation entirely
-    kcal_per_min_policy: Literal["cap", "drop"] = "cap"
-
     # Thread pool size for parallel overlap resolution. None = auto-detect CPU count.
     max_workers: int | None = None
 
@@ -84,8 +108,7 @@ class HKCleanConfig:
     ops: Dict[str, bool] = field(default_factory=lambda: {
         "coerce_numeric": True,            # Convert the value column to numeric; required by most downstream ops
         "convert_energy_to_kcal": True,    # Convert joule-based energy readings to kilocalories
-        "cap_kcal_per_min": True,          # Enforce kcal/min rate cap on energy types (see kcal_per_min_policy)
-        "apply_theory_thresholds": True,   # Drop values outside the thresholds ranges above
+        "apply_theory_thresholds": True,   # Apply configured min, max, and rate checks
         "deduplicate": True,               # Remove exact duplicate rows (same user/type/interval/value)
         "normalize_sleep_labels": True,    # Strip "HKCategoryValueSleepAnalysis" prefix from sleep values
         "apply_quantile_filter": False,    # Drop values outside quantile_lower/upper bounds (extra scan per type)
@@ -115,13 +138,47 @@ class HKCleanConfig:
                 f"got ({self.quantile_lower}, {self.quantile_upper})"
             )
         if not ops.get("coerce_numeric", True):
-            for dep in ("convert_energy_to_kcal", "cap_kcal_per_min",
-                         "apply_theory_thresholds", "apply_quantile_filter"):
+            for dep in ("convert_energy_to_kcal", "apply_theory_thresholds", "apply_quantile_filter"):
                 if ops.get(dep, False):
                     raise ValueError(
                         f"ops['{dep}'] requires coerce_numeric=True"
                     )
-        if ops.get("cap_kcal_per_min", False) and not ops.get("convert_energy_to_kcal", True):
-            raise ValueError(
-                "ops['cap_kcal_per_min']=True requires ops['convert_energy_to_kcal']=True"
-            )
+        allowed_checks = {"min", "max", "rate_per_min_max"}
+        for hk_type, checks in self.thresholds.items():
+            unknown = sorted(set(checks) - allowed_checks)
+            if unknown:
+                raise ValueError(f"thresholds['{hk_type}'] has unknown check(s): {unknown}")
+            limits: Dict[str, float] = {}
+            for check_name, rule in checks.items():
+                if not isinstance(rule, dict):
+                    raise ValueError(f"thresholds['{hk_type}']['{check_name}'] must be a rule mapping")
+                unknown_rule = sorted(set(rule) - {"limit", "action"})
+                if unknown_rule:
+                    raise ValueError(
+                        f"thresholds['{hk_type}']['{check_name}'] has unknown key(s): {unknown_rule}"
+                    )
+                if "limit" not in rule or "action" not in rule:
+                    raise ValueError(
+                        f"thresholds['{hk_type}']['{check_name}'] requires 'limit' and 'action'"
+                    )
+                try:
+                    limit = float(rule["limit"])
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"thresholds['{hk_type}']['{check_name}']['limit'] must be numeric"
+                    ) from exc
+                if not math.isfinite(limit):
+                    raise ValueError(
+                        f"thresholds['{hk_type}']['{check_name}']['limit'] must be finite"
+                    )
+                if rule["action"] not in {"cap", "drop"}:
+                    raise ValueError(
+                        f"thresholds['{hk_type}']['{check_name}']['action'] must be 'cap' or 'drop'"
+                    )
+                if check_name == "rate_per_min_max" and limit <= 0:
+                    raise ValueError(
+                        f"thresholds['{hk_type}']['rate_per_min_max']['limit'] must be > 0"
+                    )
+                limits[check_name] = limit
+            if "min" in limits and "max" in limits and limits["min"] > limits["max"]:
+                raise ValueError(f"thresholds['{hk_type}'] min limit must be <= max limit")

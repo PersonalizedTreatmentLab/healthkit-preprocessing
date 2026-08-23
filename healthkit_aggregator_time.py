@@ -4,7 +4,7 @@ Utilities for constructing analysis windows and local-time projections for Healt
 Provides:
 - build_schedule_from_input: infer a per-user timezone schedule from observed intervals.
 - build_bin_windows: create per-user fixed-frequency bin grids (UTC or local-wall clock via schedule).
-- build_assessment_anchored_windows: create windows ending at assessment anchor times.
+- build_assessment_windows: create configured lookback windows for assessments.
 - validate_schedule / compute_schedule_coverage: schedule hygiene and coverage diagnostics.
 - add_local_time_labels: attach local date/hour/DST/offset labels to UTC windows.
 
@@ -18,6 +18,7 @@ import numpy as np
 import pandas as pd
 from datetime import timedelta
 from zoneinfo import ZoneInfo
+from healthkit_aggregator_specs import AssessmentWindowSpec
 
 _logger = logging.getLogger(__name__)
 
@@ -510,8 +511,8 @@ def build_bin_windows(
     schedule: Optional[pd.DataFrame],
     tz_mode_l0: str,
     tz_policy: str,
-    bin_size: str,
-    bin_origin: str,
+    bin_size: Any,
+    bin_origin: Any,
     anchor_utc: pd.Timestamp,
     bin_seconds_nominal: int,
     bin_index_from_start: Any,
@@ -535,8 +536,7 @@ def build_bin_windows(
     report["schedule"]["source_rows_dropped_invalid"] = 0
     report["schedule"]["invalid_tz_rows"] = 0
 
-    # When UTC mode has no schedule, skip timezone column normalization entirely
-    # to avoid crashes on malformed timezone strings (Issue 1: skip policy fix).
+    # UTC mode can operate without schedule or timezone-column normalization.
     if schedule is None and tz_mode_l0 == "utc":
         users = df["user_id"].dropna().unique()
         _starts = pd.to_datetime(df["utc_start"], utc=True, errors="coerce")
@@ -633,68 +633,183 @@ def build_bin_windows(
     return windows, sch
 
 
-def build_assessment_anchored_windows(
+def build_assessment_windows(
     assessments: pd.DataFrame,
     schedule: Optional[pd.DataFrame],
     tz_policy: str,
-    duration_before: Optional[Any] = None,
+    window_spec: AssessmentWindowSpec,
+    default_bin_origin: str = "00:00:00",
+    default_tz_mode: str = "utc",
     report: Optional[Dict[str, Any]] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Build assessment anchored windows:
-    window_end = anchor_time
-    window_start = anchor_time - duration_before
-    """
+    """Build validated whole, assessment-relative, or aligned lookback bins."""
     if report is None:
         report = {}
+    window_spec.validate()
 
     if assessments is None or len(assessments) == 0:
-        empty = pd.DataFrame(columns=["user_id", "window_id", "window_start", "window_end", "window_seconds", "window_kind"])
+        empty = pd.DataFrame(columns=[
+            "user_id", "window_id", "window_start", "window_end", "window_seconds",
+            "window_kind", "assessment_id", "anchor_time", "bin_in_lookback",
+        ])
         sch = validate_schedule(schedule, [], pd.Timestamp.now(tz="UTC"), pd.Timestamp.now(tz="UTC"), tz_policy, report=report)
         return empty, sch
 
-    req = {"user_id", "anchor_time"}
+    req = {"user_id", "assessment_id", "anchor_time"}
     missing = req - set(assessments.columns)
     if missing:
         raise ValueError(f"assessments missing required columns: {sorted(missing)}")
 
-    a = assessments.copy()
+    a = assessments[["user_id", "assessment_id", "anchor_time"]].copy()
+    a["assessment_order"] = np.arange(len(a), dtype="int64")
+    normalized_users = _normalize_user_id_series(a["user_id"])
+    if normalized_users.isna().any():
+        raise ValueError("assessments.user_id must contain only nonmissing integer ids")
+    a["user_id"] = normalized_users.astype("int64")
+    if a["assessment_id"].isna().any():
+        raise ValueError("assessments.assessment_id must be nonmissing")
+    if a.duplicated(["user_id", "assessment_id"]).any():
+        raise ValueError("(user_id, assessment_id) must be unique")
+    a["anchor_time"] = _coerce_utc_series(
+        a["anchor_time"], context="assessments.anchor_time", errors="coerce"
+    )
+    if a["anchor_time"].isna().any():
+        raise ValueError("assessments.anchor_time must be nonmissing and UTC-coercible")
 
-    a["anchor_time"] = pd.to_datetime(a["anchor_time"], utc=True).dt.tz_convert("UTC")
-
-    if "duration_before" in a.columns:
-        dur = a["duration_before"]
+    rows: List[Dict[str, Any]] = []
+    if window_spec.mode in {"whole_lookback", "split_lookback"}:
+        duration = pd.to_timedelta(window_spec.duration_before)
+        n_bins = 1 if window_spec.mode == "whole_lookback" else int(window_spec.n_bins)
+        bin_duration = duration / n_bins
+        for assessment in a.itertuples(index=False):
+            lookback_start = assessment.anchor_time - duration
+            for bin_number in range(n_bins):
+                start = lookback_start + bin_duration * bin_number
+                end = (
+                    assessment.anchor_time
+                    if bin_number == n_bins - 1
+                    else start + bin_duration
+                )
+                rows.append({
+                    "user_id": assessment.user_id,
+                    "assessment_id": assessment.assessment_id,
+                    "anchor_time": assessment.anchor_time,
+                    "bin_in_lookback": bin_number,
+                    "window_start": start,
+                    "window_end": end,
+                    "assessment_order": assessment.assessment_order,
+                })
     else:
-        dur = duration_before
-    if dur is None:
-        raise ValueError("Provide duration_before (scalar) or assessments['duration_before'].")
+        n_bins = int(window_spec.n_bins)
+        step = pd.to_timedelta(window_spec.bin_size)
+        origin = pd.to_timedelta(
+            default_bin_origin if window_spec.bin_origin is None else window_spec.bin_origin
+        )
+        tz_mode = window_spec.tz_mode or default_tz_mode
+        if tz_mode == "utc":
+            epoch_anchor = pd.Timestamp("1970-01-01", tz="UTC") + origin
+            step_ns = int(step.value)
+            for assessment in a.itertuples(index=False):
+                delta_ns = int(assessment.anchor_time.value - epoch_anchor.value)
+                on_boundary = delta_ns % step_ns == 0
+                terminal_start = epoch_anchor + (
+                    (delta_ns // step_ns) - int(on_boundary)
+                ) * step
+                first_start = terminal_start - (n_bins - 1) * step
+                for bin_number in range(n_bins):
+                    start = first_start + bin_number * step
+                    end = min(start + step, assessment.anchor_time)
+                    rows.append({
+                        "user_id": assessment.user_id,
+                        "assessment_id": assessment.assessment_id,
+                        "anchor_time": assessment.anchor_time,
+                        "bin_in_lookback": bin_number,
+                        "window_start": start,
+                        "window_end": end,
+                        "assessment_order": assessment.assessment_order,
+                    })
+        else:
+            if schedule is None or schedule.empty:
+                raise ValueError("aligned_grid with tz_mode='local' requires a schedule")
+            sch_for_grid = schedule.copy()
+            sch_for_grid["user_id"] = _normalize_user_id_series(sch_for_grid["user_id"])
+            sch_for_grid["start_utc"] = _coerce_utc_series(
+                sch_for_grid["start_utc"], "schedule.start_utc", errors="coerce"
+            )
+            sch_for_grid["end_utc"] = _coerce_utc_series(
+                sch_for_grid["end_utc"], "schedule.end_utc", errors="coerce"
+            )
+            sch_for_grid = sch_for_grid.dropna(
+                subset=["user_id", "start_utc", "end_utc", "tz_name"]
+            ).copy()
+            sch_for_grid["user_id"] = sch_for_grid["user_id"].astype("int64")
+            for assessment in a.itertuples(index=False):
+                candidate_start = (
+                    assessment.anchor_time
+                    - n_bins * step
+                    - pd.Timedelta(days=2)
+                )
+                candidate_end = assessment.anchor_time + step
+                user_schedule = sch_for_grid.loc[
+                    (sch_for_grid["user_id"] == assessment.user_id)
+                    & (sch_for_grid["end_utc"] > candidate_start)
+                    & (sch_for_grid["start_utc"] < candidate_end)
+                ].copy()
+                if not user_schedule.empty:
+                    user_schedule["start_utc"] = user_schedule["start_utc"].clip(
+                        lower=candidate_start
+                    )
+                    user_schedule["end_utc"] = user_schedule["end_utc"].clip(
+                        upper=candidate_end
+                    )
+                dummy = pd.DataFrame([{
+                    "user_id": assessment.user_id,
+                    "utc_start": assessment.anchor_time,
+                    "utc_end": assessment.anchor_time,
+                }])
+                candidates = build_local_bin_grid(
+                    dummy,
+                    user_schedule,
+                    int(step.total_seconds()),
+                    step,
+                    str(default_bin_origin if window_spec.bin_origin is None else window_spec.bin_origin),
+                    pd.Timestamp("1970-01-01", tz="UTC") + origin,
+                    lambda starts: pd.Series(np.arange(len(starts)), index=starts.index),
+                    tz_policy,
+                )
+                candidates = candidates.loc[
+                    candidates["bin_start"] < assessment.anchor_time
+                ].sort_values(["bin_start", "bin_end"])
+                candidates = candidates.drop_duplicates("bin_start", keep="last").tail(n_bins)
+                if len(candidates) != n_bins:
+                    raise ValueError(
+                        f"schedule does not provide {n_bins} aligned local bins for "
+                        f"assessment {assessment.assessment_id!r}"
+                    )
+                for bin_number, candidate in enumerate(candidates.itertuples(index=False)):
+                    rows.append({
+                        "user_id": assessment.user_id,
+                        "assessment_id": assessment.assessment_id,
+                        "anchor_time": assessment.anchor_time,
+                        "bin_in_lookback": bin_number,
+                        "window_start": candidate.bin_start,
+                        "window_end": min(candidate.bin_end, assessment.anchor_time),
+                        "assessment_order": assessment.assessment_order,
+                    })
 
-    if isinstance(dur, (pd.Series, np.ndarray, list, tuple)):
-        dur_td = pd.to_timedelta(dur)
-    else:
-        dur_td = pd.to_timedelta(dur)
-
-    if isinstance(dur_td, pd.Timedelta):
-        a["_dur_before"] = dur_td
-    else:
-        a["_dur_before"] = dur_td.values
-
-    a["window_end"] = a["anchor_time"]
-    a["window_start"] = a["anchor_time"] - a["_dur_before"]
-    a["window_seconds"] = (a["window_end"] - a["window_start"]).dt.total_seconds()
-    a["window_kind"] = "anchored"
-
-    if "assessment_id" in a.columns:
-        a["window_id"] = a["assessment_id"]
-    else:
-        a["_row_id"] = np.arange(len(a)).astype("int64")
-        a["window_id"] = a["_row_id"]
-
-    windows = a[["user_id", "window_id", "window_start", "window_end", "window_seconds", "window_kind"]].copy()
-    windows["user_id"] = _normalize_user_id_series(windows["user_id"])
-    windows = windows[windows["user_id"].notna()].copy()
-    if not windows.empty:
-        windows["user_id"] = windows["user_id"].astype("int64")
+    windows = pd.DataFrame(rows)
+    windows = windows.sort_values(
+        ["assessment_order", "bin_in_lookback"], kind="stable"
+    ).reset_index(drop=True)
+    windows["window_id"] = np.arange(len(windows), dtype="int64")
+    windows["window_seconds"] = (
+        windows["window_end"] - windows["window_start"]
+    ).dt.total_seconds()
+    windows["window_kind"] = "anchored"
+    windows = windows[[
+        "user_id", "window_id", "window_start", "window_end", "window_seconds",
+        "window_kind", "assessment_id", "anchor_time", "bin_in_lookback",
+    ]]
 
     users = windows["user_id"].unique()
     utc_min = windows["window_start"].min()
@@ -729,10 +844,11 @@ def build_assessment_anchored_windows(
     windows["bin_start"] = windows["window_start"]
     windows["bin_end"] = windows["window_end"]
     windows["bin_seconds"] = windows["window_seconds"]
-    windows["bin_index"] = pd.to_numeric(windows["window_id"], errors="coerce").astype("Int64")
 
     report.setdefault("bins", {})
     report["bins"]["window_kind"] = "anchored"
+    report["bins"]["assessment_window_mode"] = window_spec.mode
+    report["bins"]["n_bins_per_assessment"] = n_bins
     report.setdefault("windows", {})["overlap_stats"] = compute_window_overlap_depth_stats(windows)
     report.setdefault("windows", {})["schedule_coverage_fraction_lt1"] = int((windows["schedule_covered_fraction"] < 1.0).sum())
 
@@ -1009,8 +1125,8 @@ def build_local_bin_grid(
     df_utc: pd.DataFrame,
     schedule: pd.DataFrame,
     bin_seconds_nominal: int,
-    bin_size: str,
-    bin_origin: str,
+    bin_size: Any,
+    bin_origin: Any,
     anchor_utc: pd.Timestamp,
     bin_index_from_start: Any,
     tz_policy: str,
@@ -1022,7 +1138,8 @@ def build_local_bin_grid(
         raise ValueError("local mode requires a travel schedule with tz ranges")
 
     step = pd.to_timedelta(bin_seconds_nominal, unit="s")
-    origin_time = pd.to_datetime(bin_origin).time()
+    origin_delta = pd.to_timedelta(bin_origin)
+    origin_time = (pd.Timestamp("1970-01-01") + origin_delta).time()
     amb = get_tz_localize_kwargs(tz_policy)
     pieces = []
 
@@ -1240,13 +1357,9 @@ def add_local_time_labels(
     """
     Robust local time labeling for UTC windows using per-user schedule.
 
-    Fixes:
-      - Preserves all rows via stable _ord key
-      - Assigns tz_name by maximum schedule overlap with each window
-      - Deterministic tie-break: overlap duration desc, overlap start asc, schedule start asc, tz_name asc
-      - Cleans schedule spans (end > start) and validates window-in-span
-      - Computes utc_offset_seconds WITHOUT .dt.utcoffset() (older pandas compat)
-      - Computes is_dst with vectorized .dt.dst() if available, else safe fallback
+    The projection preserves every window column, assigns timezone by maximum
+    schedule overlap, and uses deterministic tie-breaking. Offset and DST
+    calculations support pandas versions without vectorized ``utcoffset``.
     """
 
     # -------------------------------
@@ -1504,14 +1617,22 @@ def add_local_time_labels(
                 merged.loc[idx, "tz_name"] = pd.NA
                 continue
 
-            merged.loc[idx, "window_start_local"] = ws_loc_aw.dt.tz_localize(None)
-            merged.loc[idx, "window_end_local"] = we_loc_aw.dt.tz_localize(None)
+            local_starts = merged["window_start_local"].copy()
+            local_ends = merged["window_end_local"].copy()
+            local_starts.loc[idx] = ws_loc_aw.dt.tz_localize(None).to_numpy()
+            local_ends.loc[idx] = we_loc_aw.dt.tz_localize(None).to_numpy()
+            merged["window_start_local"] = local_starts
+            merged["window_end_local"] = local_ends
 
             # ✅ compatible offset computation
-            merged.loc[idx, "utc_offset_seconds"] = _offset_seconds_from_strftime(ws_loc_aw).astype("float").values
+            offsets = merged["utc_offset_seconds"].copy()
+            offsets.loc[idx] = _offset_seconds_from_strftime(ws_loc_aw).astype("float").values
+            merged["utc_offset_seconds"] = offsets
 
             # ✅ compatible DST computation
-            merged.loc[idx, "is_dst"] = _is_dst_series(ws_loc_aw).values
+            dst_flags = merged["is_dst"].copy()
+            dst_flags.loc[idx] = _is_dst_series(ws_loc_aw).values
+            merged["is_dst"] = dst_flags
 
     if report is not None and tz_fail_count:
         report.setdefault("local_time_labels", {})["tz_conversion_failures"] = tz_fail_count
@@ -1539,7 +1660,9 @@ def add_local_time_labels(
                .clip(upper=1)
                .astype("Int64")
         )
-        merged.loc[tmp.index, "fold"] = fold_vals.values
+        fold = merged["fold"].copy()
+        fold.loc[tmp.index] = fold_vals.values
+        merged["fold"] = fold
 
     # local_minute_index (sequence within local day)
     merged["local_minute_index"] = pd.Series(pd.NA, dtype="Int64", index=merged.index)
@@ -1552,16 +1675,19 @@ def add_local_time_labels(
                .cumcount()
                .astype("Int64")
         )
-        merged.loc[tmp.index, "local_minute_index"] = lmi_vals.values
+        minute_index = merged["local_minute_index"].copy()
+        minute_index.loc[tmp.index] = lmi_vals.values
+        merged["local_minute_index"] = minute_index
 
     # -------------------------------
-    # 6) Return (script 2 style: fixed keep set, best-effort if some missing)
+    # 6) Return all window metadata plus the local projection
     # -------------------------------
-    keep = [
-        "user_id", "window_id", "window_start", "window_end", "window_seconds", "window_kind",
+    internal = {"_ord", "start_utc_sched", "end_utc_sched"}
+    original = [c for c in windows.columns if c in merged.columns and c not in internal]
+    labels = [
         "window_start_local", "window_end_local", "local_date", "anchor_local_date",
         "local_hour", "minute_of_day", "local_minute_index",
         "tz_name", "is_dst", "fold", "utc_offset_seconds", "local_weekday", "iso_week",
     ]
-    keep_existing = [c for c in keep if c in merged.columns]
+    keep_existing = original + [c for c in labels if c in merged.columns and c not in original]
     return merged[keep_existing].copy()

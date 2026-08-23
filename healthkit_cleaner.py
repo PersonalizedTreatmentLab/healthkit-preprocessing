@@ -296,9 +296,7 @@ class HealthKitCleaner:
         0. Filter to observations recorded by Apple Watch.
         1. Coerce `value` to numeric and drop rows that cannot be parsed.
         2. If type==EnergyBurned: Convert Joules to kcal.
-        3. Drop/clip outliers based on theory thresholds
-            - if type is ActiveEnergyBurned or BasalEnergyBurned: cap implausible kcal/min (not drop)
-            - apply value range thresholds (min/max)
+        3. Apply independent min, max, and rate-per-minute plausibility rules.
         4. Drop outliers based on quantile
         5. Calls combine_overlaps per user for value
         """
@@ -329,7 +327,8 @@ class HealthKitCleaner:
         if self.rules.ops.get("convert_energy_to_kcal", True) and "EnergyBurned" in hk_type:
             duration_min = (df["utc_end"] - df["utc_start"]) / pd.Timedelta("1m")
             valid_duration = duration_min.gt(0) & duration_min.notna()
-            cap_raw = self.rules.thresholds.get(hk_type, {}).get("kcal_per_min_max", 30.0)
+            rate_rule = self.rules.thresholds.get(hk_type, {}).get("rate_per_min_max", {})
+            cap_raw = rate_rule.get("limit", 30.0)
             try:
                 cap = float(cap_raw)
             except (TypeError, ValueError):
@@ -365,47 +364,12 @@ class HealthKitCleaner:
                 hk_type, rep['converted_to_kcal'],
             )
 
-        # 3a. Cap kcal/min for ActiveEnergyBurned and BasalEnergyBurned
-        if self.rules.ops.get("cap_kcal_per_min", True) and hk_type in {"ActiveEnergyBurned", "BasalEnergyBurned"}:
-            duration_min = (df["utc_end"] - df["utc_start"]) / pd.Timedelta("1m")
-            safe_dur = duration_min.replace(0, np.nan)
-            rate = df["value"] / safe_dur
-            cap_raw = self.rules.thresholds.get(hk_type, {}).get("kcal_per_min_max", 30.0)
-            try:
-                cap = float(cap_raw)
-            except (TypeError, ValueError):
-                cap = 30.0
-            if cap <= 0:
-                cap = 30.0
-            over = rate > cap
-            rep["kcal_per_min_capped"] = int(over.fillna(False).sum())
-
-            policy = getattr(self.rules, "kcal_per_min_policy", "cap")
-            if policy == "drop":
-                # Drop intervals above the cap
-                df = df.loc[~over.fillna(False)].copy()
-                self.logger.info(
-                    "[Activity handler] Dropped kcal/min for type '%s' on %d intervals",
-                    hk_type, rep['kcal_per_min_capped'],
-                )
-            else:
-                # For rows above the cap, rescale `value` to cap * duration
-                df.loc[over, "value"] = duration_min.loc[over] * cap
-                self.logger.info(
-                    "[Activity handler] Capped kcal/min for type '%s' on %d intervals",
-                    hk_type, rep['kcal_per_min_capped'],
-                )
-
-        # 3b. Drop values outside configured [min, max] range for this type
+        # 3. Apply value rules before rate rules so each check has independent semantics.
         if self.rules.ops.get("apply_theory_thresholds", True):
             thr = self.rules.thresholds.get(hk_type, {})
             if thr:
-                df, dropped = self._filter_range(df, thr.get("min"), thr.get("max"), col="value")
-                rep["out_of_range_dropped"] = int(dropped)
-                self.logger.info(
-                    "[Activity handler] Applied theory thresholds for type '%s', dropped %d out-of-range rows; %d rows remain",
-                    hk_type, rep['out_of_range_dropped'], len(df),
-                )
+                df = self._apply_value_threshold_rules(df, thr, rep)
+                df = self._apply_rate_threshold_rule(df, thr, rep)
 
         # 4. Combine overlapping intervals per user (uses `combine_overlaps`)
         if self.rules.ops.get("combine_overlaps", True):
@@ -464,16 +428,11 @@ class HealthKitCleaner:
                 hk_type, rep['deduplicated'], len(df),
             )
 
-        # 3. Apply configured [min, max] value thresholds for this type
+        # 3. Apply configured value thresholds for this type
         if self.rules.ops.get("apply_theory_thresholds", True):
             thr = self.rules.thresholds.get(hk_type, {})
             if thr:
-                df, dropped = self._filter_range(df, thr.get("min"), thr.get("max"), col="value")
-                rep["out_of_range_dropped"] = int(dropped)
-                self.logger.info(
-                    "[Vitals handler] Applied theory thresholds for type '%s', dropped %d out-of-range rows; %d rows remain",
-                    hk_type, rep['out_of_range_dropped'], len(df),
-                )
+                df = self._apply_value_threshold_rules(df, thr, rep)
 
         # 4. Apply quantile range filtering
         if (self.rules.ops.get("apply_quantile_filter", True)
@@ -509,16 +468,11 @@ class HealthKitCleaner:
         # 1. Coerce `value` to numeric and drop unparsable rows
         df = self._coerce_value_numeric(df, rep, hk_type, handler_label="Audio handler")
 
-        # 2. Apply configured [min, max] value thresholds for this type
+        # 2. Apply configured value thresholds for this type
         if self.rules.ops.get("apply_theory_thresholds", True):
             thr = self.rules.thresholds.get(hk_type, {})
             if thr:
-                df, dropped = self._filter_range(df, thr.get("min"), thr.get("max"), col="value")
-                rep["out_of_range_dropped"] = int(dropped)
-                self.logger.info(
-                    "[Audio handler] Applied theory thresholds for type '%s', dropped %d out-of-range rows; %d rows remain",
-                    hk_type, rep['out_of_range_dropped'], len(df),
-                )
+                df = self._apply_value_threshold_rules(df, thr, rep)
 
         # 3. Combine overlapping intervals per user (uses `combine_overlaps`)
         if self.rules.ops.get("combine_overlaps", True):
@@ -789,6 +743,57 @@ class HealthKitCleaner:
 
         n_dropped = int((~mask).sum())
         return df[mask].copy(), n_dropped
+
+    @staticmethod
+    def _apply_value_threshold_rules(
+        df: pd.DataFrame,
+        thresholds: Dict[str, Dict[str, Any]],
+        report: Dict[str, Any],
+    ) -> pd.DataFrame:
+        """Apply independent minimum and maximum actions to the value column."""
+        out = df.copy()
+        for check_name, operator in (("min", "below"), ("max", "above")):
+            rule = thresholds.get(check_name)
+            if rule is None or out.empty:
+                continue
+            limit = float(rule["limit"])
+            action = str(rule["action"])
+            violation = out["value"] < limit if operator == "below" else out["value"] > limit
+            count = int(violation.fillna(False).sum())
+            report[f"{check_name}_{'capped' if action == 'cap' else 'dropped'}"] = count
+            if action == "cap":
+                out.loc[violation, "value"] = limit
+            else:
+                out = out.loc[~violation.fillna(False)].copy()
+        return out
+
+    @staticmethod
+    def _apply_rate_threshold_rule(
+        df: pd.DataFrame,
+        thresholds: Dict[str, Dict[str, Any]],
+        report: Dict[str, Any],
+    ) -> pd.DataFrame:
+        """Apply an independent rate-per-minute action to interval totals."""
+        rule = thresholds.get("rate_per_min_max")
+        if rule is None or df.empty:
+            return df
+
+        out = df.copy()
+        duration_minutes = (out["utc_end"] - out["utc_start"]) / pd.Timedelta("1m")
+        valid_duration = duration_minutes.gt(0) & duration_minutes.notna()
+        report["rate_per_min_max_skipped_invalid_duration"] = int((~valid_duration).sum())
+
+        limit = float(rule["limit"])
+        rate = out["value"] / duration_minutes.where(valid_duration)
+        violation = valid_duration & rate.gt(limit)
+        count = int(violation.sum())
+        action = str(rule["action"])
+        report[f"rate_per_min_max_{'capped' if action == 'cap' else 'dropped'}"] = count
+        if action == "cap":
+            out.loc[violation, "value"] = duration_minutes.loc[violation] * limit
+        else:
+            out = out.loc[~violation].copy()
+        return out
 
     @staticmethod
     def _is_valid_timezone_name(tz_name: str) -> bool:

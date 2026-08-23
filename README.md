@@ -4,7 +4,7 @@
 
 ## Overview
 
-A Python pipeline that converts raw Apple HealthKit CSV exports into analysis-ready, wide-format feature matrices. The pipeline follows a three-stage architecture: **load**, **clean**, **aggregate**. It is fully configurable through dataclass-based configuration objects, so researchers can customize feature plausibility thresholds, aggregation windowing, and output aggregated features without modifying core code. Optional post-aggregation branches provide quality control masking, hierarchical aggregation (e.g., hourly to daily), and dedicated sleep feature extraction.
+A Python pipeline that converts raw Apple HealthKit CSV exports into analysis-ready, wide-format feature matrices. The pipeline follows a three-stage architecture: **load**, **clean**, **aggregate**. It is fully configurable through dataclass-based configuration objects, so researchers can customize feature plausibility thresholds, fixed or assessment-relative windowing, granular sleep features, and output aggregates without modifying core code. Optional branches provide quality control masking, hierarchical aggregation (e.g., hourly to daily), HRV, participant-aware zero filling, and assessment-safe daily sleep features.
 
 ---
 
@@ -25,7 +25,7 @@ A Python pipeline that converts raw Apple HealthKit CSV exports into analysis-re
 
 | Package | Version    | Role                                |
 |---------|------------|-------------------------------------|
-| Python  | >= 3.9     | Runtime                             |
+| Python  | >= 3.10    | Runtime                             |
 | pandas  | >= 2.0     | Core data manipulation              |
 | numpy   | >= 1.24    | Numeric operations                  |
 | tqdm    | >= 4.66    | Progress bars for bulk loading      |
@@ -55,22 +55,22 @@ The pipeline recognizes the following Apple HealthKit types out-of-the-box. Each
 
 | Type | Time behavior | Stage 2 handler | Device class | Default aggregates (Stage 3) |
 |---|---|---|---|---|
-| `StepCount` | interval_total | activity | either | `sum`, `duration`, `rate_per_min` |
-| `DistanceWalkingRunning` | interval_total | activity | either | `sum`, `duration`, `rate_per_min` |
-| `DistanceCycling` | interval_total | activity | either | `sum`, `duration`, `rate_per_min` |
-| `FlightsClimbed` | interval_total | activity | either | `sum`, `duration`, `rate_per_min` |
-| `ActiveEnergyBurned` | interval_total | activity | either | `sum`, `duration`, `rate_per_min` |
-| `BasalEnergyBurned` | interval_total | activity | either | `sum`, `duration`, `rate_per_min` |
-| `AppleExerciseTime` | interval_total | activity | either | `sum` |
-| `AppleStandTime` | interval_total | activity | either | `sum` |
-| `EnvironmentalAudioExposure` | interval_level | audio | either | `leq`, `energy_seconds`, `time_weighted_mean`, `max`, `duration`, `median`, `median_duration`, `count`, `p95`, `time_above_85` |
-| `HeadphoneAudioExposure` | interval_level | audio | non_watch_exclusive | `leq`, `energy_seconds`, `time_weighted_mean`, `max`, `duration`, `median`, `median_duration`, `count`, `p95`, `time_above_85` |
+| `StepCount` | interval_total | activity | either | `sum`, `duration`, `rate_per_min`, continuity indicators |
+| `DistanceWalkingRunning` | interval_total | activity | either | `sum`, `duration`, `rate_per_min`, continuity indicators |
+| `DistanceCycling` | interval_total | activity | either | `sum`, `duration`, `rate_per_min`, continuity indicators |
+| `FlightsClimbed` | interval_total | activity | either | `sum`, `duration`, `rate_per_min`, continuity indicators |
+| `ActiveEnergyBurned` | interval_total | activity | either | `sum`, `duration`, `rate_per_min`, continuity indicators |
+| `BasalEnergyBurned` | interval_total | activity | either | `sum`, `duration`, `rate_per_min`, continuity indicators |
+| `AppleExerciseTime` | interval_total | activity | either | `sum`, continuity indicators |
+| `AppleStandTime` | interval_total | activity | either | `sum`, continuity indicators |
+| `EnvironmentalAudioExposure` | interval_level | audio | either | `leq`, `energy_seconds`, `time_weighted_mean`, `max`, `duration`, `median`, `median_duration`, `count`, continuity indicators |
+| `HeadphoneAudioExposure` | interval_level | audio | non_watch_exclusive | `leq`, `energy_seconds`, `time_weighted_mean`, `max`, `duration`, `median`, `median_duration`, `count`, continuity indicators |
 | `HeartRate` | point | vitals | watch_exclusive | `mean`, `median`, `std`, `max`, `min`, `count` (also drives wear detection and optional HRV) |
-| `HeartRateVariabilitySDNN` | point | vitals | watch_exclusive | `mean`, `median`, `std`, `max`, `min`, `count`, `p75` |
+| `HeartRateVariabilitySDNN` | point | vitals | watch_exclusive | `mean`, `median`, `std`, `max`, `min`, `count` |
 | `RespiratoryRate` | point | vitals | watch_exclusive | `mean`, `median`, `std`, `max`, `min`, `count` |
-| `OxygenSaturation` | point | vitals | watch_exclusive | `mean`, `median`, `std`, `max`, `min`, `count`, `pct_below_92` |
-| `SleepAnalysis` | categorical_interval | cat | either | per-label `sum`, `mean`, `count`, `start`, `end` for `in_bed`, `asleep`, `awake`, `sleep_unknown` |
-| `EnvironmentalAudioExposureEvent` | categorical_interval | cat | either | `sum`, `mean`, `count` for the `momentary_limit` label |
+| `OxygenSaturation` | point | vitals | watch_exclusive | `mean`, `median`, `std`, `max`, `min`, `count` |
+| `SleepAnalysis` | categorical_interval | cat | either | 60 configurable label/union duration, count, and continuity features |
+| `EnvironmentalAudioExposureEvent` | categorical_interval | cat | either | `sum`, `mean`, `count`, and continuity for `momentary_limit` |
 
 **Time-behavior categories, at a glance:**
 Assignment to aggregation windows works differently depending on the time behavior of the stream.
@@ -355,8 +355,13 @@ from healthkit_cleaner_specs import HKCleanConfig
 
 # Only override what you need
 cleaner = HealthKitCleaner(HKCleanConfig(
-    kcal_per_min_policy="drop",     # drop instead of cap
-    apply_quantile_filter=True,     # apply quantile filter
+    thresholds={
+        "StepCount": {
+            "min": {"limit": 0, "action": "drop"},
+            "rate_per_min_max": {"limit": 300, "action": "cap"},
+        },
+    },
+    ops={**HKCleanConfig().ops, "apply_quantile_filter": True},
     quantile_lower=0.02,            # tighter quantile bounds
     quantile_upper=0.98,
 ))
@@ -367,41 +372,44 @@ cleaner = HealthKitCleaner(HKCleanConfig(
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `required_cols` | set | `{"user_id", "type", "local_start", "local_end", "value", "utc_start", "utc_end"}` | Columns that must be present in the input DataFrame |
-| `kcal_per_min_policy` | str | `"cap"` | When energy burn rate exceeds `kcal_per_min_max`: `"cap"` clamps the value; `"drop"` removes the row |
 | `max_workers` | int or None | `None` | Thread pool size for parallel overlap resolution. `None` auto-detects CPU count. |
 | `quantile_lower` | float | `0.01` | Lower percentile bound for outlier removal (only used when `apply_quantile_filter` is enabled) |
 | `quantile_upper` | float | `0.99` | Upper percentile bound for outlier removal |
 
 #### Default plausibility thresholds
 
-Observations outside these ranges are dropped when `apply_theory_thresholds` is enabled. You can override any type's thresholds in your config — types not listed here pass through without range filtering.
+Each check has its own `limit` and `action`. A `drop` action removes the row. A `cap` action clamps a value bound or rescales an interval total to `rate limit × duration_minutes`. Value bounds run before rate checks. Rate checks with zero, missing, or invalid durations are skipped and reported.
 
-| Type | Min | Max | Unit |
-|------|-----|-----|------|
-| HeartRate | 30 | 200 | bpm |
-| HeartRateVariabilitySDNN | 0 | 1 | seconds |
-| RespiratoryRate | 0.1 | 100 | breaths/min |
-| OxygenSaturation | 0.50 | 1.0 | fraction |
-| EnvironmentalAudioExposure | 0 | — | dB |
-| HeadphoneAudioExposure | 0 | — | dB |
-| StepCount | 0 | — | steps |
-| AppleExerciseTime | 0 | — | minutes |
-| ActiveEnergyBurned | 0 | — | kcal (+ `kcal_per_min_max`: 30) |
-| BasalEnergyBurned | 0 | — | kcal (+ `kcal_per_min_max`: 30) |
-| AppleStandTime | 0 | — | minutes |
-| DistanceCycling | 0 | — | meters |
-| DistanceWalkingRunning | 0 | — | meters |
-| FlightsClimbed | 0 | — | flights |
+| Type | Minimum | Maximum | Rate per minute maximum |
+|------|---------|---------|-------------------------|
+| HeartRate | 25, drop | 240, drop | — |
+| HeartRateVariabilitySDNN | 0, drop | 1, drop | — |
+| RespiratoryRate | 0.1, drop | 100, drop | — |
+| OxygenSaturation | 0.50, drop | 1.0, drop | — |
+| EnvironmentalAudioExposure | 0, drop | — | — |
+| HeadphoneAudioExposure | 0, drop | — | — |
+| StepCount | 0, drop | — | 350, cap |
+| AppleExerciseTime | 0, drop | — | — |
+| ActiveEnergyBurned | 0, drop | — | 30, cap |
+| BasalEnergyBurned | 0, drop | — | 10, cap |
+| AppleStandTime | 0, drop | — | — |
+| DistanceCycling | 0, drop | — | 2000, cap |
+| DistanceWalkingRunning | 0, drop | — | 750, cap |
+| FlightsClimbed | 0, drop | 8000, drop | — |
 
 To override thresholds:
 
 ```python
 cleaner = HealthKitCleaner(HKCleanConfig(
     thresholds={
-        "HeartRate": {"min": 40, "max": 180},       # tighter HR range
-        "OxygenSaturation": {"min": 0.70, "max": 1.0},  # raise SpO2 floor
-        "StepCount": {"min": 0},                     # keep default
-        # ... only include types you want to set
+        "HeartRate": {
+            "min": {"limit": 40, "action": "drop"},
+            "max": {"limit": 180, "action": "drop"},
+        },
+        "StepCount": {
+            "min": {"limit": 0, "action": "drop"},
+            "rate_per_min_max": {"limit": 300, "action": "cap"},
+        },
     },
 ))
 ```
@@ -416,8 +424,7 @@ Each cleaning step can be independently enabled or disabled via the `ops` dict. 
 |-----------|---------|-------------|
 | `coerce_numeric` | **on** | Convert the `value` column to numeric; required by most downstream operations |
 | `convert_energy_to_kcal` | **on** | Detect and convert joule-based energy readings to kilocalories |
-| `cap_kcal_per_min` | **on** | Enforce a kcal/min rate cap on energy types using `kcal_per_min_policy` |
-| `apply_theory_thresholds` | **on** | Drop values outside the `thresholds` ranges |
+| `apply_theory_thresholds` | **on** | Apply configured minimum, maximum, and rate rules independently |
 | `deduplicate` | **on** | Remove exact duplicate rows (same user/type/interval/value) |
 | `normalize_sleep_labels` | **on** | Strip the `HKCategoryValueSleepAnalysis` prefix from sleep values, producing clean labels like `"InBed"`, `"Asleep"`, `"Awake"` |
 | `apply_quantile_filter` | **off** | Drop values outside `quantile_lower`/`quantile_upper` bounds (extra per-type scan) |
@@ -432,7 +439,6 @@ cleaner = HealthKitCleaner(HKCleanConfig(
     ops={
         "coerce_numeric": True,
         "convert_energy_to_kcal": True,
-        "cap_kcal_per_min": True,
         "apply_theory_thresholds": True,
         "deduplicate": True,
         "normalize_sleep_labels": True,
@@ -444,11 +450,10 @@ cleaner = HealthKitCleaner(HKCleanConfig(
 ))
 ```
 
-> **Note:** When you provide an `ops` dict, it replaces the entire default dict. Include all 10 keys, not just the ones you changed. If you want to make targeted changes, you may also simply modify the default values in `healthkit_cleaner_specs.py`.
+> **Note:** When you provide an `ops` dict, it replaces the entire default dict. Include all keys, or copy the default mapping and change selected entries as shown above.
 
 > **Dependency constraints** (enforced by `validate()`):
-> - `convert_energy_to_kcal`, `cap_kcal_per_min`, `apply_theory_thresholds`, and `apply_quantile_filter` all require `coerce_numeric=True`
-> - `cap_kcal_per_min` requires `convert_energy_to_kcal=True`
+> - `convert_energy_to_kcal`, `apply_theory_thresholds`, and `apply_quantile_filter` require `coerce_numeric=True`.
 
 ### Type routing and cleaning handlers
 
@@ -457,7 +462,7 @@ The cleaner groups rows by `type` and routes them to one of five handlers. Each 
 **Activity types** → `_handle_activity`
 Types: `StepCount`, `AppleExerciseTime`, `ActiveEnergyBurned`, `BasalEnergyBurned`, `AppleStandTime`, `DistanceCycling`, `DistanceWalkingRunning`, `FlightsClimbed`
 
-Pipeline: watch device filter → numeric coercion → energy unit conversion (Joules → kcal) → kcal/min rate capping → plausibility thresholds → overlap resolution → quantile filtering
+Pipeline: watch device filter → numeric coercion → energy unit conversion (Joules → kcal) → value and rate rules → overlap resolution → quantile filtering
 
 **Vital types** → `_handle_vitals`
 Types: `HeartRate`, `HeartRateVariabilitySDNN`, `RespiratoryRate`, `OxygenSaturation`
@@ -493,7 +498,7 @@ When `return_report=True`, the cleaner returns a `(DataFrame, report_dict)` tupl
 | Key | Contents |
 |-----|----------|
 | `__global__` | `rows_in`, `rows_out`, `dropped_missing_or_negative_time`, `dropped_missing_type`, `dropped_missing_user_id`, `dropped_invalid_user_id_non_numeric`, `types_seen`, `types_without_handler` |
-| `<TypeName>` | Per-type entry with `rows_in`, `rows_out`, `handler` name, and handler-specific counters (e.g., `watch_filter_dropped`, `out_of_range_dropped`, `kcal_per_min_capped`, `deduplicated`, `overlap_input_intervals`, `overlap_output_intervals`, `quantile_filtered_dropped`) |
+| `<TypeName>` | Per-type entry with `rows_in`, `rows_out`, `handler` name, and handler-specific counters such as `min_dropped`, `max_capped`, `rate_per_min_max_capped`, `rate_per_min_max_skipped_invalid_duration`, `deduplicated`, overlap counts, and quantile-filter counts |
 
 ---
 
@@ -505,18 +510,18 @@ The aggregator converts cleaned long-form observations into a wide feature matri
 
 1. Validates and normalizes the input DataFrame
 2. Infers a per-user timezone schedule (or uses one you provide -- recommended to have it inferred)
-3. Builds time windows — either fixed-width bins (e.g., every hour) or assessment-anchored windows (e.g., 4 hours before each assessment)
+3. Builds fixed-width bins or one of three explicitly configured assessment lookback layouts
 4. Assigns each observation to windows based on its type's time behavior (how the data overlaps with window boundaries)
 5. Derives watch-wear metrics from heart rate coverage
 6. Aggregates each type within its windows to produce named feature columns (e.g., `HeartRate__mean`, `StepCount__sum`)
-7. Optionally computes HRV features, applies zero-fill for missing-but-expected data, and runs quality control
+7. Optionally computes HRV, applies participant-aware per-statistic filling, and merges daily sleep features without using records after an assessment
 
 ### Scripts
 
 | File | Role |
 |------|------|
 | `healthkit_aggregator.py` | Main aggregator class (`HealthKitAggregator`) with all public methods |
-| `healthkit_aggregator_specs.py` | Configuration dataclass (`HKAggConfig`), type registry, `LayerSpec`/`LayerRule` for hierarchical rollups, and operator registry |
+| `healthkit_aggregator_specs.py` | `HKAggConfig`, `AssessmentWindowSpec`, `SleepFeatureSpec`, the type registry, hierarchical rollup specs, and the operator registry |
 | `healthkit_aggregator_time.py` | *Internal* — window construction, timezone schedule building, local-time projection. Used by the aggregator automatically. |
 | `healthkit_hrv.py` | *Internal* — HRV feature computation (time-domain and frequency-domain). Used when `compute_hrv=True`. |
 
@@ -535,7 +540,7 @@ wide, report, aux = aggregator.run_aggregation(cleaned_df)
 |--------------|-------------|
 | `wide` | DataFrame with one row per `(user_id, window_id)`. Feature columns are named `<Type>__<stat>` (e.g., `HeartRate__mean`, `StepCount__sum`). Also includes `window_start`, `window_end`, `window_seconds`, and (depending on `output_timezone`) UTC and/or local timestamp columns. |
 | `report` | Nested dict with sections: `input` (normalization counts), `bins` (window counts per user), `wear` (watch-on rates), `fills` (zero-fill counts by column), `qc` (dropped/masked counts), `timing`, and `config_snapshot` (full config as a dict). |
-| `aux` | Dict of supporting artifacts: `windows` (window definitions), `win_wear` (per-window wear), `day_wear` (per-day wear), `participant_wear` (per-participant wear), `presence` (window presence flags by type), `schedule` (timezone schedule). Pass `aux` to `apply_quality_control`. |
+| `aux` | Dict of supporting artifacts: `windows`, `win_wear`, `day_wear`, `participant_wear`, `presence`, `schedule`, and `daily_sleep` (empty unless requested). Pass `aux` to `apply_quality_control`. |
 
 ### Configuration (`HKAggConfig`)
 
@@ -561,7 +566,46 @@ You may also simply change the default values in `healthkit_aggregator_specs.py`
 | `bin_origin` | str | `"00:00:00"` | Time-of-day that windows align to (e.g., `"00:00:00"` = midnight) |
 | `tz_mode_l0` | str | `"utc"` | `"utc"` bins by UTC timestamps; `"local"` bins by local wall-clock time |
 | `output_timezone` | str | `"both"` | Which timestamps appear in the output: `"UTC"`, `"local"`, or `"both"` |
-| `assessment_duration_before` | str or None | `None` | For assessment-anchored windows: look-back duration (e.g., `"7D"`). When `None`, fixed bins are used instead. |
+
+#### Assessment lookback windows
+
+Assessment aggregation requires an `assessments` DataFrame with unique, nonmissing `(user_id, assessment_id)` pairs and a UTC-coercible `anchor_time`, plus one `AssessmentWindowSpec`. The spec rejects fields that are missing or irrelevant for its mode.
+
+| Mode | Required fields | Exact behavior |
+|------|-----------------|----------------|
+| `whole_lookback` | `duration_before` | One window from `anchor_time - duration_before` through the assessment. |
+| `split_lookback` | `duration_before`, `n_bins` | Divides the full assessment-relative lookback into `n_bins` equal windows. |
+| `aligned_grid` | `n_bins`, `bin_size`; optional `bin_origin`, `tz_mode` | Selects the last `n_bins` canonical bins and truncates only the terminal bin when the assessment is off-grid. An assessment exactly on a boundary receives `n_bins` complete preceding bins. |
+
+Assessment windows carry `assessment_id`, `anchor_time`, and zero-based `bin_in_lookback`. `window_id` is an independent internal key, and `window_seconds` records the actual duration of a shortened terminal bin. Assessment windows do not use `bin_index`.
+
+```python
+import pandas as pd
+
+from healthkit_aggregator import HealthKitAggregator
+from healthkit_aggregator_specs import AssessmentWindowSpec
+
+assessments = pd.DataFrame({
+    "user_id": [101],
+    "assessment_id": ["ema-001"],
+    "anchor_time": ["2025-01-01T17:36:00Z"],
+})
+
+window_spec = AssessmentWindowSpec(
+    mode="aligned_grid",
+    n_bins=4,
+    bin_size="1H",
+)
+
+wide, report, aux = HealthKitAggregator().run_aggregation(
+    cleaned_df,
+    assessments=assessments,
+    assessment_window=window_spec,
+    include_daily_sleep=True,
+)
+```
+
+With a UTC hourly grid, this example produces 14:00–15:00, 15:00–16:00, 16:00–17:00, and 17:00–17:36. `aligned_grid` is generally the most convenient assessment mode for sequence models because positions represent canonical clock intervals while `window_seconds` preserves the terminal-bin exposure.
 
 #### Wear detection
 
@@ -602,8 +646,29 @@ wide_qc, report_qc = aggregator.apply_quality_control(wide, aux)
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `apply_zero_fill` | bool | `False` | When enabled, fills missing-but-expected observations with zeros when the type's `zero_fill_gate` condition is met (e.g., watch was worn but no steps were recorded → `StepCount__sum = 0`) |
+| `apply_zero_fill` | bool | `False` | Enables the per-statistic `zero_fill_rules` in the type registry. No granular values are filled by default. |
 | `apply_sleep_qc_fill_nan` | bool | `False` | When enabled, apply_sleep_quality_control() will fill missing daily sleep stage/category aggregates with zeros when sleep duration is present |
+
+Each granular rule has an independent gate, fill value, and availability policy:
+
+```python
+step_count_registry = {
+    "StepCount": {
+        "time_behavior": "interval_total",
+        "aggregates": ("sum", "duration", "rate_per_min"),
+        "device_class": "either",
+        "zero_fill_rules": {
+            "sum": {
+                "gate": ("watch_on", {}),
+                "fill_value": 0.0,
+                "availability": "participant_evidence",
+            },
+        },
+    }
+}
+```
+
+`participant_evidence` requires evidence in the complete validated input, before window pruning, that the participant produces the type. Fine-grained sleep labels require the exact label; sleep unions require any constituent label. `assume_available` explicitly permits filling without participant evidence. The gate must also pass. This keeps a stream that the participant's device never emits as NaN while allowing explicit zero semantics for streams known to be available.
 
 
 #### HRV
@@ -635,14 +700,14 @@ Values represent totals accumulated across an interval (e.g., total steps). The 
 
 | Type | Aggregates | Device class |
 |------|------------|--------------|
-| StepCount | `sum`, `duration`, `rate_per_min` | either |
-| DistanceCycling | `sum`, `duration`, `rate_per_min` | either |
-| DistanceWalkingRunning | `sum`, `duration`, `rate_per_min` | either |
-| FlightsClimbed | `sum`, `duration`, `rate_per_min` | either |
-| ActiveEnergyBurned | `sum`, `duration`, `rate_per_min` | either |
-| BasalEnergyBurned | `sum`, `duration`, `rate_per_min` | either |
-| AppleExerciseTime | `sum` | either |
-| AppleStandTime | `sum` | either |
+| StepCount | `sum`, `duration`, `rate_per_min`, continuity indicators | either |
+| DistanceCycling | `sum`, `duration`, `rate_per_min`, continuity indicators | either |
+| DistanceWalkingRunning | `sum`, `duration`, `rate_per_min`, continuity indicators | either |
+| FlightsClimbed | `sum`, `duration`, `rate_per_min`, continuity indicators | either |
+| ActiveEnergyBurned | `sum`, `duration`, `rate_per_min`, continuity indicators | either |
+| BasalEnergyBurned | `sum`, `duration`, `rate_per_min`, continuity indicators | either |
+| AppleExerciseTime | `sum`, continuity indicators | either |
+| AppleStandTime | `sum`, continuity indicators | either |
 
 #### Interval level types
 
@@ -650,8 +715,10 @@ Values represent a sustained level across an interval (e.g., dB exposure). The a
 
 | Type | Aggregates | Special aggregates | Device class |
 |------|------------|-------------------|--------------|
-| EnvironmentalAudioExposure | `leq`, `energy_seconds`, `time_weighted_mean`, `max`, `duration`, `median`, `median_duration`, `count` | `p95` (95th percentile), `time_above_85` (seconds above 85 dB) | either |
-| HeadphoneAudioExposure | `leq`, `energy_seconds`, `time_weighted_mean`, `max`, `duration`, `median`, `median_duration`, `count` | `p95`, `time_above_85` | non_watch_exclusive |
+| EnvironmentalAudioExposure | `leq`, `energy_seconds`, `time_weighted_mean`, `max`, `duration`, `median`, `median_duration`, `count`, continuity indicators | `p95` (95th percentile), `time_above_85` (seconds above 85 dB) | either |
+| HeadphoneAudioExposure | `leq`, `energy_seconds`, `time_weighted_mean`, `max`, `duration`, `median`, `median_duration`, `count`, continuity indicators | `p95`, `time_above_85` | non_watch_exclusive |
+
+Special aggregates are defined in `special_aggregates`; add their names to the type's `aggregates` tuple when you want them emitted.
 
 #### Point types
 
@@ -666,12 +733,25 @@ Instantaneous measurements (e.g., a single heart rate reading at a point in time
 
 #### Categorical interval types
 
-Labeled time intervals (e.g., sleep stages). The aggregator computes per-label duration, mean, count, start time, and end time.
+Labeled time intervals (e.g., sleep stages). The continuity indicators are 1 only when the original interval extends strictly across the relevant boundary. An interval that starts or ends exactly on a boundary has indicator 0.
 
 | Type | Aggregates (per label) | Device class |
 |------|----------------------|--------------|
-| SleepAnalysis | `sum_label_*`, `mean_label_*`, `count_label_*`, `start_label_*`, `end_label_*` for labels: `in_bed`, `asleep`, `awake`, `sleep_unknown` | either |
-| EnvironmentalAudioExposureEvent | `sum_label_momentary_limit`, `mean_label_momentary_limit`, `count_label_momentary_limit` | either |
+| SleepAnalysis | Configurable `sum`, `mean`, `count`, `continues_from_previous_bin`, and `continues_into_next_bin` for nine exact labels and three unions | either |
+| EnvironmentalAudioExposureEvent | Duration, count, and continuity for `momentary_limit` | either |
+
+`SleepFeatureSpec()` emits all 60 granular sleep features by default: five statistics for each of nine normalized labels and five statistics for each of the `in_bed`, `asleep`, and `awake` unions. `AwakeUnspecified` belongs to both the asleep and awake unions. To request a smaller deterministic schema:
+
+```python
+from healthkit_aggregator_specs import HKAggConfig, SleepFeatureSpec, build_default_type_registry
+
+sleep_features = SleepFeatureSpec(
+    labels=("asleep_core", "asleep_deep", "asleep_rem"),
+    unions=("asleep",),
+    statistics=("sum", "count", "continues_into_next_bin"),
+)
+config = HKAggConfig(type_registry=build_default_type_registry(sleep_features))
+```
 
 ### Hierarchical aggregation
 
@@ -702,23 +782,53 @@ Each `LayerRule` specifies an output column name (`out`), an operator (`op`), an
 
 ### Daily sleep features
 
-A dedicated method extracts per-day sleep metrics independently from the main aggregation:
+A daily sleep row is separate from the 60 granular sleep features. Granular features describe one aggregation window and split intervals at window boundaries. Daily sleep uses complete source records, assigns each record wholly to the 15:00-anchored day containing its `local_start`, and never splits a record at 15:00.
+
+Set `include_daily_sleep=True` to calculate and merge daily features into the returned `wide` matrix:
 
 ```python
-sleep_df = aggregator.compute_daily_sleep_features(cleaned_df, qc=True)
-sleep_df = aggregator.apply_sleep_quality_control(sleep_df)
+wide, report, aux = aggregator.run_aggregation(
+    cleaned_df,
+    include_daily_sleep=True,
+)
+
+daily_sleep = aux["daily_sleep"]
 ```
 
-Days are anchored at 15:00 local time (so a night of sleep is attributed to the calendar date it wakes up on). `InBed` coverage is the union of all sleep-analysis labels (`InBed`, any `Asleep*`, any `Awake*`, `CategoryValueUnknown`); `Asleep` coverage is every label except the explicit `Awake*` labels. Clock-hour features are expressed as hours since the prior local midnight (so 26.5 = 02:30 the next morning).
+The merge key is derived from each granular row's local window start:
 
-Output has one row per (`user_id`, `date`) with the columns below.
+```python
+sleep_date = (window_start_local + pd.Timedelta(hours=9)).date()
+```
+
+Daily rows merge on `(user_id, sleep_date)` for fixed grids and `(user_id, assessment_id, sleep_date)` for assessment windows. The same daily values repeat across all granular rows whose starts belong to that 15:00–15:00 sleep day. If no daily sleep row exists, the merged daily columns remain NaN.
+
+For an assessment at 17:36, a 14:00–15:00 row receives the sleep day ending at 15:00. Rows beginning at 15:00, 16:00, and 17:00 receive the assessment-truncated sleep day beginning at 15:00. `sleep_day_elapsed_fraction` distinguishes that shorter current day from complete historical days.
+
+For assessment runs, daily features are calculated independently for each assessment. Sleep intervals whose `utc_end` is after the assessment are excluded in full; they are not shortened. Point samples after the assessment are also excluded. For fixed-grid runs, the supplied data is treated as complete for its daily rows.
+
+`InBed` coverage is the union of all sleep-analysis labels (`InBed`, any `Asleep*`, any `Awake*`, `CategoryValueUnknown`). The asleep union contains `Asleep`, `AsleepUnspecified`, `AsleepCore`, `AsleepDeep`, `AsleepREM`, `CategoryValueUnknown`, and `AwakeUnspecified`. The awake union contains `Awake` and `AwakeUnspecified`.
+
+The direct method remains available when a separate daily table is useful:
+
+```python
+sleep_df = aggregator.compute_daily_sleep_features(
+    cleaned_df,
+    assessments=assessments,  # omit for complete fixed-grid days
+    schedule=timezone_schedule,
+    qc=True,
+)
+```
+
+Output has one row per `(user_id, sleep_date)` or `(user_id, assessment_id, sleep_date)`.
 
 **Identifiers**
 
 | Column | Description |
 |---|---|
 | `user_id` | Participant identifier carried through from the input. |
-| `date` | Local calendar date the night/day is attributed to (the day *after* the 15:00 anchor). |
+| `assessment_id` | Present for assessment-specific daily rows. |
+| `sleep_date` | Local calendar date on which the 15:00-anchored sleep day ends. |
 
 **Durations and timing (hours)**
 
@@ -727,24 +837,25 @@ Output has one row per (`user_id`, `date`) with the columns below.
 | `sleep_bedrest_duration_day` | Total time in bed — sum of durations of all in-bed-category segments on the day. |
 | `sleep_sleep_duration_day` | Total sleep time (TST) — sum of durations of all asleep-category segments. |
 | `sleep_awake_duration_day` | Total time labeled `Awake`/`AwakeUnspecified` during the in-bed window. |
-| `sleep_wake_after_sleep_onset_day` | WASO: `awake_duration` minus the first awake segment between bedrest onset and sleep onset (i.e., awakenings after first sleep onset). |
+| `sleep_wake_after_sleep_onset_day` | Sum of complete awake-category records starting at or after first sleep onset and ending no later than the last sleep offset. |
 | `sleep_sleep_onset_latency_day` | Time from bedrest onset to first sleep onset. |
-| `sleep_bedrest_onset_hours_day` | Clock hour of first in-bed segment, in hours since prior local midnight (values > 24 cross midnight). |
-| `sleep_bedrest_offset_hours_day` | Clock hour of the last in-bed segment's end. |
-| `sleep_sleep_onset_hours_day` | Clock hour of first asleep segment. |
-| `sleep_sleep_offset_hours_day` | Clock hour of last asleep segment's end. |
+| `sleep_first_bedrest_start_hours_day` | Clock hour of the first in-bed record's start, expressed relative to the prior local midnight; values above 24 cross midnight. |
+| `sleep_last_bedrest_end_hours_day` | Clock hour of the last in-bed record's end. |
+| `sleep_first_onset_hours_day` | Clock hour of the first asleep record's start. |
+| `sleep_last_offset_hours_day` | Clock hour of the last asleep record's end. |
+| `sleep_day_elapsed_fraction` | 1 for a complete historical sleep day; otherwise the fraction of the assessment-containing 15:00 day elapsed at the assessment. |
 
 **Quality and context**
 
 | Column | Description |
 |---|---|
 | `sleep_efficiency_day` | `sleep_duration / bedrest_duration`, clipped to [0, 1]; 0 is coerced to NaN. |
-| `sleep_hr_median_day` | Median `HeartRate` across samples falling inside the sleep window (`sleep_onset` to `sleep_offset`). BPM. |
-| `sleep_hrv_median_day` | Median `HeartRateVariabilitySDNN` across samples inside the sleep window. Milliseconds. |
-| `sleep_bedrest_audio_median_day` | Median `EnvironmentalAudioExposure` across samples inside the bedrest window. dBA. |
+| `sleep_sleep_hr_median_day` | Median `HeartRate` among point samples that fall inside at least one actual asleep-category record. BPM. |
+| `sleep_sleep_hrv_median_day` | Median `HeartRateVariabilitySDNN` among point samples inside actual asleep-category records. |
+| `sleep_bedrest_audio_median_day` | Median `EnvironmentalAudioExposure` among samples inside actual in-bed-category records. No LEQ substitution is applied. |
 
 **Per-stage statistics**
-For each sleep-analysis label `<stage>` observed on the day (`InBed`, `Asleep`, `AsleepUnspecified`, `AsleepCore`, `AsleepDeep`, `AsleepREM`, `Awake`, `AwakeUnspecified`, `CategoryValueUnknown`), three columns are emitted:
+For each sleep-analysis label `<stage>` observed anywhere in the supplied dataset, three columns are emitted. The daily stage schema is therefore data-dependent, while the core daily columns are fixed.
 
 | Column pattern | Description |
 |---|---|
@@ -763,6 +874,18 @@ Stage columns only appear when that label is present in the input, so the exact 
 - `sleep_Awake_sum_day`: values > 20 h → NaN.
 - If `HKAggConfig.apply_sleep_qc_fill_nan` is set, rows that have a non-NaN `sleep_sleep_duration_day` get missing `InBed`/`Asleep`/`Awake`/`CategoryValueUnknown` stage stats (sum/mean/count) filled with 0.
 
+### Feature manifest and model preparation
+
+`get_feature_manifest()` returns the configured granular feature schema in deterministic order. After a run with daily sleep enabled, it also records the core daily features and the stage columns observed in that run.
+
+```python
+manifest = aggregator.get_feature_manifest()
+```
+
+Each row includes the output name, cadence, source type, aggregation, label or union, units, value type, device class, and zero-fill semantics. Configured granular columns are retained in `wide` even when an input batch has no observations for that feature, so batching does not change granular schema or order.
+
+For deep learning, `aligned_grid` usually provides the clearest sequence representation. Keep `window_seconds` as an input or mask so the model can identify the shortened terminal bin, and use `sleep_day_elapsed_fraction` when daily sleep is present. Fit normalization, imputation, learned missingness handling, and any outcome-informed feature selection on training data only, then apply those fitted transformations unchanged to validation and test data.
+
 ### Reports
 
 The `report` dict from `run_aggregation` contains:
@@ -773,6 +896,7 @@ The `report` dict from `run_aggregation` contains:
 | `bins` | `bin_seconds_nominal`, `bin_origin_utc`, `counts_per_user` (dict of user_id → window count), `non_empty_bin_counts_by_type`, `early_pruned_bins` |
 | `wear` | `bin_seconds_worn_total`, `bin_watch_on_rate`, `day_valid_rate`, `participant_overall_frac_mean`, `day_valid_counts`, `participant_valid_counts` |
 | `fills` | `counts_by_column` — number of values zero-filled per feature column |
+| `daily_sleep` | Daily row count and the exact daily feature columns produced when `include_daily_sleep=True` |
 | `qc` | `dropped_counts` and `masked_counts` at bin/day/participant levels, `pruned_empty_rows` |
 | `config_snapshot` | Full `HKAggConfig` as a dict (for reproducibility) |
 
@@ -782,7 +906,7 @@ The `report` dict from `run_aggregation` contains:
 
 ### Basic workflow
 
-A complete pipeline from raw exports to a daily feature CSV:
+A complete pipeline from raw exports to granular and hierarchical feature CSVs:
 
 ```python
 from healthkit_loader import HealthKitLoader
@@ -803,9 +927,12 @@ cleaner = HealthKitCleaner()
 clean_df, clean_report = cleaner.clean(raw_df, return_report=True)
 print(f"Cleaned: {len(clean_df)} rows remaining")
 
-# ── 3. Aggregate (1-hour windows) ────────────────────────────
+# ── 3. Aggregate (1-hour windows + merged daily sleep) ──────
 aggregator = HealthKitAggregator(HKAggConfig(bin_size="1H"))
-wide, agg_report, aux = aggregator.run_aggregation(clean_df)
+wide, agg_report, aux = aggregator.run_aggregation(
+    clean_df,
+    include_daily_sleep=True,
+)
 
 # ── 4. Quality control ───────────────────────────────────────
 wide_qc, qc_report = aggregator.apply_quality_control(wide, aux)
@@ -825,19 +952,10 @@ day_spec = LayerSpec(
 layers, _ = aggregator.run_hierarchical_aggregation(wide_qc, [day_spec])
 daily = layers["daily"]
 
-# ── 6. Daily sleep features ──────────────────────────────────
-sleep = aggregator.compute_daily_sleep_features(clean_df, qc=True)
-
-# ── 7. Merge sleep into daily ─────────────────────────────────
-daily = daily.merge(
-    sleep.rename(columns={"date": "local_date"}),
-    on=["user_id", "local_date"],
-    how="left",
-)
-
-# ── 8. Export ─────────────────────────────────────────────────
+# ── 6. Export ─────────────────────────────────────────────────
+wide_qc.to_csv("features_hourly_with_daily_sleep.csv", index=False)
 daily.to_csv("features_daily.csv", index=False)
-print(f"Exported {len(daily)} daily feature rows")
+aggregator.get_feature_manifest().to_csv("feature_manifest.csv", index=False)
 ```
 
 ### Inspecting reports
@@ -908,15 +1026,16 @@ Apple HealthKit CSV exports
 │  • Derive wear metrics          │
 │  • Optional HRV features        │  (healthkit_hrv.py)
 │  • Optional zero-fill           │
+│  • Optional daily sleep merge   │
 └────────────┬────────────────────┘
              │
              ▼
   Wide feature matrix
   [user_id, window_id, HeartRate__mean, StepCount__sum, ...]
              │
-    ┌────────┼──────────────────────────┐
-    ▼        ▼                          ▼
-  QC Pass   Hierarchical Rollup    Daily Sleep Features
-  (drop /   (hourly → daily)       compute_daily_sleep_features()
-   mask)    LayerSpec / LayerRule   apply_sleep_quality_control()
+    ┌────────┴───────────────────┐
+    ▼                            ▼
+  QC Pass                 Hierarchical Rollup
+  (drop / mask)           (hourly → daily)
+                         LayerSpec / LayerRule
 ```
