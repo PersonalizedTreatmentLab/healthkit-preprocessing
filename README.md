@@ -23,13 +23,13 @@ A Python pipeline that converts raw Apple HealthKit CSV exports into analysis-re
 
 ## Tech Stack
 
-| Package | Version    | Role                                |
-|---------|------------|-------------------------------------|
-| Python  | >= 3.10    | Runtime                             |
-| pandas  | >= 2.0     | Core data manipulation              |
-| numpy   | >= 1.24    | Numeric operations                  |
-| tqdm    | >= 4.66    | Progress bars for bulk loading      |
-| scipy   | >= 1.10    | *Optional* — frequency-domain HRV   |
+| Package | Version | Role                              |
+| ------- | ------- | --------------------------------- |
+| Python  | >= 3.10 | Runtime                           |
+| pandas  | >= 2.0  | Core data manipulation            |
+| numpy   | >= 1.24 | Numeric operations                |
+| tqdm    | >= 4.66 | Progress bars for bulk loading    |
+| scipy   | >= 1.10 | *Optional* — frequency-domain HRV |
 
 ---
 
@@ -46,34 +46,34 @@ pip install -r requirements.txt
 
 > **Note:** `scipy` is only required if you enable frequency-domain HRV features (`compute_hrv=True` and `hrv_freq_domain=True` in `HKAggConfig`). The pipeline runs without it, and these features aren't typically recommended by default due to data limitations.
 
-
 ---
 
 ## HealthKit Datastreams Supported by Default
 
 The pipeline recognizes the following Apple HealthKit types out-of-the-box. Each type is routed through a cleaning handler (Stage 2) and an aggregation profile (Stage 3) that depend on its **time behavior**. Types not listed here still pass through loading and a minimal cleaning path. For more elaborate cleaning and aggregation, new types must be configured in appropriate registries.
 
-| Type | Time behavior | Stage 2 handler | Device class | Default aggregates (Stage 3) |
-|---|---|---|---|---|
-| `StepCount` | interval_total | activity | either | `sum`, `duration`, `rate_per_min`, continuity indicators |
-| `DistanceWalkingRunning` | interval_total | activity | either | `sum`, `duration`, `rate_per_min`, continuity indicators |
-| `DistanceCycling` | interval_total | activity | either | `sum`, `duration`, `rate_per_min`, continuity indicators |
-| `FlightsClimbed` | interval_total | activity | either | `sum`, `duration`, `rate_per_min`, continuity indicators |
-| `ActiveEnergyBurned` | interval_total | activity | either | `sum`, `duration`, `rate_per_min`, continuity indicators |
-| `BasalEnergyBurned` | interval_total | activity | either | `sum`, `duration`, `rate_per_min`, continuity indicators |
-| `AppleExerciseTime` | interval_total | activity | either | `sum`, continuity indicators |
-| `AppleStandTime` | interval_total | activity | either | `sum`, continuity indicators |
-| `EnvironmentalAudioExposure` | interval_level | audio | either | `leq`, `energy_seconds`, `time_weighted_mean`, `max`, `duration`, `median`, `median_duration`, `count`, continuity indicators |
-| `HeadphoneAudioExposure` | interval_level | audio | non_watch_exclusive | `leq`, `energy_seconds`, `time_weighted_mean`, `max`, `duration`, `median`, `median_duration`, `count`, continuity indicators |
-| `HeartRate` | point | vitals | watch_exclusive | `mean`, `median`, `std`, `max`, `min`, `count` (also drives wear detection and optional HRV) |
-| `HeartRateVariabilitySDNN` | point | vitals | watch_exclusive | `mean`, `median`, `std`, `max`, `min`, `count` |
-| `RespiratoryRate` | point | vitals | watch_exclusive | `mean`, `median`, `std`, `max`, `min`, `count` |
-| `OxygenSaturation` | point | vitals | watch_exclusive | `mean`, `median`, `std`, `max`, `min`, `count` |
-| `SleepAnalysis` | categorical_interval | cat | either | 60 configurable label/union duration, count, and continuity features |
-| `EnvironmentalAudioExposureEvent` | categorical_interval | cat | either | `sum`, `mean`, `count`, and continuity for `momentary_limit` |
+| Type                              | Time behavior        | Stage 2 handler | Device class        | Default aggregates (Stage 3)                                                                                                  |
+| --------------------------------- | -------------------- | --------------- | ------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `StepCount`                       | interval_total       | activity        | either              | `sum`, `duration`, `rate_per_min`, continuity indicators                                                                      |
+| `DistanceWalkingRunning`          | interval_total       | activity        | either              | `sum`, `duration`, `rate_per_min`, continuity indicators                                                                      |
+| `DistanceCycling`                 | interval_total       | activity        | either              | `sum`, `duration`, `rate_per_min`, continuity indicators                                                                      |
+| `FlightsClimbed`                  | interval_total       | activity        | either              | `sum`, `duration`, `rate_per_min`, continuity indicators                                                                      |
+| `ActiveEnergyBurned`              | interval_total       | activity        | either              | `sum`, `duration`, `rate_per_min`, continuity indicators                                                                      |
+| `BasalEnergyBurned`               | interval_total       | activity        | either              | `sum`, `duration`, `rate_per_min`, continuity indicators                                                                      |
+| `AppleExerciseTime`               | interval_total       | activity        | either              | `sum`, continuity indicators                                                                                                  |
+| `AppleStandTime`                  | interval_total       | activity        | either              | `sum`, continuity indicators                                                                                                  |
+| `EnvironmentalAudioExposure`      | interval_level       | audio           | either              | `leq`, `energy_seconds`, `time_weighted_mean`, `max`, `duration`, `median`, `median_duration`, `count`, continuity indicators |
+| `HeadphoneAudioExposure`          | interval_level       | audio           | non_watch_exclusive | `leq`, `energy_seconds`, `time_weighted_mean`, `max`, `duration`, `median`, `median_duration`, `count`, continuity indicators |
+| `HeartRate`                       | point                | vitals          | watch_exclusive     | `mean`, `median`, `std`, `max`, `min`, `count` (also drives wear detection and optional HRV)                                  |
+| `HeartRateVariabilitySDNN`        | point                | vitals          | watch_exclusive     | `mean`, `median`, `std`, `max`, `min`, `count`                                                                                |
+| `RespiratoryRate`                 | point                | vitals          | watch_exclusive     | `mean`, `median`, `std`, `max`, `min`, `count`                                                                                |
+| `OxygenSaturation`                | point                | vitals          | watch_exclusive     | `mean`, `median`, `std`, `max`, `min`, `count`                                                                                |
+| `SleepAnalysis`                   | categorical_interval | cat             | either              | 60 configurable label/union duration, count, and continuity features                                                          |
+| `EnvironmentalAudioExposureEvent` | categorical_interval | cat             | either              | `sum`, `mean`, `count`, and continuity for `momentary_limit`                                                                  |
 
 **Time-behavior categories, at a glance:**
 Assignment to aggregation windows works differently depending on the time behavior of the stream.
+
 - **interval_total** — cumulative counts/totals over an interval (e.g., steps in a 10-minute window). Values are split proportionally across window boundaries when intervals straddle them.
 - **interval_level** — a sustained level maintained over an interval (e.g., ambient dB). Aggregation is time-weighted.
 - **point** — an instantaneous sample at one moment (e.g., a single heart-rate reading). Observations are assigned to whichever window contains the sample timestamp.
@@ -109,26 +109,26 @@ All other input columns (e.g., `device.name`, `device_source_id`, source metadat
 
 ### Scripts
 
-| File | Role |
-|------|------|
-| `healthkit_loader.py` | Main loader class (`HealthKitLoader`) with three public entry points |
-| `healthkit_loader_specs.py` | Configuration dataclass (`HKLoadConfig`) controlling timezone and DST behavior |
-| `healthkit_loader_report_analyzer.py` | CLI that aggregates saved loader report JSON files into Markdown summaries |
+| File                                  | Role                                                                           |
+| ------------------------------------- | ------------------------------------------------------------------------------ |
+| `healthkit_loader.py`                 | Main loader class (`HealthKitLoader`) with three public entry points           |
+| `healthkit_loader_specs.py`           | Configuration dataclass (`HKLoadConfig`) controlling timezone and DST behavior |
+| `healthkit_loader_report_analyzer.py` | CLI that aggregates saved loader report JSON files into Markdown summaries     |
 
 ### Expected input CSV format
 
 Files must be `.csv` — the loader raises `ValueError("Unknown file format")` on any other suffix. The loader is tolerant of a few column-name variants (it renames them into the canonical form during loading), but the following **logical** columns must be resolvable for each file:
 
-| Logical column | Accepted input names | Required? | Notes |
-|---|---|---|---|
-| `user_id` | `user_id` | yes | Must be coercible to an integer; non-numeric rows are dropped |
-| `type` | `type` | yes | HealthKit type label. Accepts CamelCase (`HeartRate`, `StepCount`) or SHOUTY form (`HEART_RATE`); SHOUTY is auto-converted. |
-| `value` | `value`, `body.quantity.value`, `body.category.value` | yes | Numeric for quantity types, string label for category types (e.g., sleep stages). Merged into `value`. |
-| `local_start`, `local_end` | `local_start`, `local_end` | yes | Naive local timestamps (parseable by `pd.to_datetime`). |
-| `timezone` | `timezone`, `HKTimezone`, `HKTimeZone` | yes | IANA string (e.g., `"America/Los_Angeles"`). Missing/invalid values are handled via `timezone_missing_policy`. |
-| `utc_start`, `utc_end` | `utc_start`, `utc_end` | optional | If absent, computed from `local_start`/`local_end` + `timezone`. |
-| `local_start_tz`, `local_end_tz` | `local_start_tz`, `local_end_tz` | optional | If absent, computed during localization. |
-| `device.name` | `device.name` | optional | When present, the loader derives `device.name_id`. |
+| Logical column                   | Accepted input names                                  | Required? | Notes                                                                                                                       |
+| -------------------------------- | ----------------------------------------------------- | --------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `user_id`                        | `user_id`                                             | yes       | Must be coercible to an integer; non-numeric rows are dropped                                                               |
+| `type`                           | `type`                                                | yes       | HealthKit type label. Accepts CamelCase (`HeartRate`, `StepCount`) or SHOUTY form (`HEART_RATE`); SHOUTY is auto-converted. |
+| `value`                          | `value`, `body.quantity.value`, `body.category.value` | yes       | Numeric for quantity types, string label for category types (e.g., sleep stages). Merged into`value`.                       |
+| `local_start`, `local_end`       | `local_start`, `local_end`                            | yes       | Naive local timestamps (parseable by`pd.to_datetime`).                                                                      |
+| `timezone`                       | `timezone`, `HKTimezone`, `HKTimeZone`                | yes       | IANA string (e.g.,`"America/Los_Angeles"`). Missing/invalid values are handled via `timezone_missing_policy`.               |
+| `utc_start`, `utc_end`           | `utc_start`, `utc_end`                                | optional  | If absent, computed from`local_start`/`local_end` + `timezone`.                                                             |
+| `local_start_tz`, `local_end_tz` | `local_start_tz`, `local_end_tz`                      | optional  | If absent, computed during localization.                                                                                    |
+| `device.name`                    | `device.name`                                         | optional  | When present, the loader derives`device.name_id`.                                                                           |
 
 Any additional columns (e.g., `device_source_id`, source identifiers, metadata) are retained as-is.
 
@@ -216,32 +216,32 @@ Instead of overriding defaults when you create the config, you can also change t
 
 **All configuration fields:**
 
-| Field | Type | Default | Options | Description |
-|-------|------|---------|---------|-------------|
-| `timezone_missing_policy` | str | `"fill_default"` | `"fill_default"`, `"drop_rows"`, `"error"` | What to do when a row's timezone is missing or invalid. `"fill_default"` substitutes `default_tz`; `"drop_rows"` removes the row; `"error"` raises immediately. |
-| `default_tz` | str | `"America/Los_Angeles"` | Any valid IANA timezone | Fallback timezone string. Only used when `timezone_missing_policy` is `"fill_default"`. |
-| `dst_ambiguous` | str | `"infer"` | `"infer"`, `"NaT"`, `"raise"` | How to handle ambiguous times during fall-back (same clock time occurs twice). `"infer"` picks the most likely offset; `"NaT"` sets the timestamp to missing; `"raise"` raises an error. If `"infer"` fails on a group, the loader falls back to the second fold (standard time) and records the event in the DST report section. |
-| `dst_nonexistent` | str | `"shift_forward"` | `"shift_forward"`, `"NaT"`, `"raise"` | How to handle nonexistent times during spring-forward (clock skips ahead). `"shift_forward"` moves to the next valid time; `"NaT"` sets to missing; `"raise"` raises an error. |
+| Field                     | Type | Default                 | Options                                    | Description                                                                                                                                                                                                                                                                                                                      |
+| ------------------------- | ---- | ----------------------- | ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `timezone_missing_policy` | str  | `"fill_default"`        | `"fill_default"`, `"drop_rows"`, `"error"` | What to do when a row's timezone is missing or invalid.`"fill_default"` substitutes `default_tz`; `"drop_rows"` removes the row; `"error"` raises immediately.                                                                                                                                                                   |
+| `default_tz`              | str  | `"America/Los_Angeles"` | Any valid IANA timezone                    | Fallback timezone string. Only used when`timezone_missing_policy` is `"fill_default"`.                                                                                                                                                                                                                                           |
+| `dst_ambiguous`           | str  | `"infer"`               | `"infer"`, `"NaT"`, `"raise"`              | How to handle ambiguous times during fall-back (same clock time occurs twice).`"infer"` picks the most likely offset; `"NaT"` sets the timestamp to missing; `"raise"` raises an error. If `"infer"` fails on a group, the loader falls back to the second fold (standard time) and records the event in the DST report section. |
+| `dst_nonexistent`         | str  | `"shift_forward"`       | `"shift_forward"`, `"NaT"`, `"raise"`      | How to handle nonexistent times during spring-forward (clock skips ahead).`"shift_forward"` moves to the next valid time; `"NaT"` sets to missing; `"raise"` raises an error.                                                                                                                                                    |
 
 ### Output columns
 
 The loader produces a long-form DataFrame containing at least these canonical columns:
 
-| Column | Description |
-|--------|-------------|
-| `user_id` | Participant identifier (int64) |
-| `type` | Normalized HealthKit type name (e.g., `"HeartRate"`, `"StepCount"`, `"SleepAnalysis"`) |
-| `value` | Observation value — numeric for quantity types, string label for category types (e.g., `"InBed"`, `"Asleep"`) |
-| `timezone` | IANA timezone string (e.g., `"America/Los_Angeles"`) |
-| `local_start`, `local_end` | Naive local timestamps (datetime64, tz-stripped after localization) |
-| `local_start_tz`, `local_end_tz` | Timezone-aware local timestamps (datetime64) |
-| `utc_start`, `utc_end` | UTC timestamps (datetime64) |
+| Column                           | Description                                                                                                  |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `user_id`                        | Participant identifier (int64)                                                                               |
+| `type`                           | Normalized HealthKit type name (e.g.,`"HeartRate"`, `"StepCount"`, `"SleepAnalysis"`)                        |
+| `value`                          | Observation value — numeric for quantity types, string label for category types (e.g.,`"InBed"`, `"Asleep"`) |
+| `timezone`                       | IANA timezone string (e.g.,`"America/Los_Angeles"`)                                                          |
+| `local_start`, `local_end`       | Naive local timestamps (datetime64, tz-stripped after localization)                                          |
+| `local_start_tz`, `local_end_tz` | Timezone-aware local timestamps (datetime64)                                                                 |
+| `utc_start`, `utc_end`           | UTC timestamps (datetime64)                                                                                  |
 
 Additional columns that are created conditionally:
 
-| Column | When it appears |
-|--------|-----------------|
-| `device.name_id` | When the input CSV has a `device.name` column and does not already have `device.name_id`. Values: `2` (Apple Watch), `1` (iPhone), `0` (other); nullable `Int8`. |
+| Column           | When it appears                                                                                                                                                 |
+| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `device.name_id` | When the input CSV has a`device.name` column and does not already have `device.name_id`. Values: `2` (Apple Watch), `1` (iPhone), `0` (other); nullable `Int8`. |
 
 Any other columns present in the input CSV (e.g., `device.name`, `device_source_id`, source metadata) pass through unchanged.
 
@@ -251,28 +251,28 @@ Every loader method accepts `return_report=True`, which returns a `(DataFrame, r
 
 **Single-file report** (returned by `load_file`; embedded in the `files` list of participant/bulk reports):
 
-| Key | Contents |
-|-----|----------|
-| `__global__` | `path`, `file_type` (always `"csv"`), `rows_in_raw`, `rows_out`, `rows_dropped_total`, and `dropped_by_reason` (a dict keyed by reason: `timezone_missing_or_invalid`, `user_id_non_numeric`). |
-| `timezone` | `missing_column_rows`, `missing_value_rows`, `invalid_value_rows`, `filled_default_rows`, `dropped_rows`, and `invalid_values_sample` (up to 5 unique bad TZ strings). |
-| `dst` | `fallback_ambiguous_false_rows`, `nonexistent_detected_rows`, `nonexistent_resolved_policy`, `ambiguous_infer_fail_rows`, `fallback_used` (bool), and `fallback_samples` (list of up to 5 per-row diagnostics: `row_index`, `user_id`, `timezone`, `label`, `local_time`). |
-| `user_id` | `rows_in`, `rows_dropped_non_numeric`, `sample_values` (up to 5 bad IDs). |
+| Key          | Contents                                                                                                                                                                                                                                                                   |
+| ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `__global__` | `path`, `file_type` (always `"csv"`), `rows_in_raw`, `rows_out`, `rows_dropped_total`, and `dropped_by_reason` (a dict keyed by reason: `timezone_missing_or_invalid`, `user_id_non_numeric`).                                                                             |
+| `timezone`   | `missing_column_rows`, `missing_value_rows`, `invalid_value_rows`, `filled_default_rows`, `dropped_rows`, and `invalid_values_sample` (up to 5 unique bad TZ strings).                                                                                                     |
+| `dst`        | `fallback_ambiguous_false_rows`, `nonexistent_detected_rows`, `nonexistent_resolved_policy`, `ambiguous_infer_fail_rows`, `fallback_used` (bool), and `fallback_samples` (list of up to 5 per-row diagnostics: `row_index`, `user_id`, `timezone`, `label`, `local_time`). |
+| `user_id`    | `rows_in`, `rows_dropped_non_numeric`, `sample_values` (up to 5 bad IDs).                                                                                                                                                                                                  |
 
 **Participant report** (returned by `load_participant`):
 
-| Key | Contents |
-|-----|----------|
-| `__global__` | `data_folder`, `user_id`, `files_scanned`, `files_found`, `files_missing`, `rows_out`. |
-| `files` | List of per-file reports (same structure as `load_file`). |
-| `missing_files` | List of expected-but-absent file paths. |
+| Key             | Contents                                                                               |
+| --------------- | -------------------------------------------------------------------------------------- |
+| `__global__`    | `data_folder`, `user_id`, `files_scanned`, `files_found`, `files_missing`, `rows_out`. |
+| `files`         | List of per-file reports (same structure as`load_file`).                               |
+| `missing_files` | List of expected-but-absent file paths.                                                |
 
 **Bulk report** (returned by `load_bulk`):
 
-| Key | Contents |
-|-----|----------|
-| `__global__` | `root`, `patterns`, `files_matched`, `files_loaded`, `files_failed`, `rows_out`. |
-| `files` | List of per-file reports for successfully loaded files. |
-| `failed_files` | List of `{"path": ..., "error_type": ..., "error": ...}` entries for files that raised (only populated when `strict=False`). |
+| Key            | Contents                                                                                                                    |
+| -------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `__global__`   | `root`, `patterns`, `files_matched`, `files_loaded`, `files_failed`, `rows_out`.                                            |
+| `files`        | List of per-file reports for successfully loaded files.                                                                     |
+| `failed_files` | List of`{"path": ..., "error_type": ..., "error": ...}` entries for files that raised (only populated when `strict=False`). |
 
 Reports can be saved to JSON for later analysis:
 
@@ -287,7 +287,7 @@ with open("load_report.json", "w") as f:
 
 ### Report Analyzer CLI
 
-The script `healthkit_loader_report_analyzer.py` is a command-line tool that reads saved loader report JSON files and generates Markdown summaries. It ranks files by issue severity, aggregates per-participant metrics, and builds event taxonomy tables. 
+The script `healthkit_loader_report_analyzer.py` is a command-line tool that reads saved loader report JSON files and generates Markdown summaries. It ranks files by issue severity, aggregates per-participant metrics, and builds event taxonomy tables.
 
 ***Note**: In testing, warnings generally only arose during DST fall-back hours, where the script had to assume observations belonged to one hour over the other. By default, Python's timezone handling methods assign observations to the second hour.*
 
@@ -307,17 +307,17 @@ python healthkit_loader_report_analyzer.py reports/ --fail-on warning --dst-warn
 
 **CLI arguments:**
 
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `inputs` | *(required)* | Report file(s), directory path(s), or glob(s) |
-| `--pattern` | `load_report*.json` | Glob pattern used when an input is a directory |
-| `--out-dir` | None | Output directory for Markdown files |
-| `--stdout` | off | Print Markdown to stdout instead of writing files |
-| `--max-files` | `10` | Max files listed in top/problem sections |
-| `--max-participants` | `15` | Max participants listed |
-| `--sample-limit` | `3` | Max sample items per metric |
-| `--fail-on` | `none` | Exit non-zero if severity >= `none` \| `error` \| `warning` \| `info` |
-| `--dst-warning-threshold` | None | Escalate DST info events to warning if count exceeds this value |
+| Argument                  | Default             | Description                                                          |
+| ------------------------- | ------------------- | -------------------------------------------------------------------- |
+| `inputs`                  | *(required)*        | Report file(s), directory path(s), or glob(s)                        |
+| `--pattern`               | `load_report*.json` | Glob pattern used when an input is a directory                       |
+| `--out-dir`               | None                | Output directory for Markdown files                                  |
+| `--stdout`                | off                 | Print Markdown to stdout instead of writing files                    |
+| `--max-files`             | `10`                | Max files listed in top/problem sections                             |
+| `--max-participants`      | `15`                | Max participants listed                                              |
+| `--sample-limit`          | `3`                 | Max sample items per metric                                          |
+| `--fail-on`               | `none`              | Exit non-zero if severity >=`none` \| `error` \| `warning` \| `info` |
+| `--dst-warning-threshold` | None                | Escalate DST info events to warning if count exceeds this value      |
 
 ---
 
@@ -329,9 +329,9 @@ The cleaner enforces data quality on the long-form observations produced by the 
 
 ### Scripts
 
-| File | Role |
-|------|------|
-| `healthkit_cleaner.py` | Main cleaner class (`HealthKitCleaner`) with the `clean()` method and per-type handlers |
+| File                         | Role                                                                                                 |
+| ---------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `healthkit_cleaner.py`       | Main cleaner class (`HealthKitCleaner`) with the `clean()` method and per-type handlers              |
 | `healthkit_cleaner_specs.py` | Configuration dataclass (`HKCleanConfig`) with thresholds, operation toggles, and behavioral options |
 
 ### How to use
@@ -369,33 +369,33 @@ cleaner = HealthKitCleaner(HKCleanConfig(
 
 **General configuration fields:**
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `required_cols` | set | `{"user_id", "type", "local_start", "local_end", "value", "utc_start", "utc_end"}` | Columns that must be present in the input DataFrame |
-| `max_workers` | int or None | `None` | Thread pool size for parallel overlap resolution. `None` auto-detects CPU count. |
-| `quantile_lower` | float | `0.01` | Lower percentile bound for outlier removal (only used when `apply_quantile_filter` is enabled) |
-| `quantile_upper` | float | `0.99` | Upper percentile bound for outlier removal |
+| Field            | Type        | Default                                                                            | Description                                                                                   |
+| ---------------- | ----------- | ---------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `required_cols`  | set         | `{"user_id", "type", "local_start", "local_end", "value", "utc_start", "utc_end"}` | Columns that must be present in the input DataFrame                                           |
+| `max_workers`    | int or None | `None`                                                                             | Thread pool size for parallel overlap resolution.`None` auto-detects CPU count.               |
+| `quantile_lower` | float       | `0.01`                                                                             | Lower percentile bound for outlier removal (only used when`apply_quantile_filter` is enabled) |
+| `quantile_upper` | float       | `0.99`                                                                             | Upper percentile bound for outlier removal                                                    |
 
 #### Default plausibility thresholds
 
 Each check has its own `limit` and `action`. A `drop` action removes the row. A `cap` action clamps a value bound or rescales an interval total to `rate limit × duration_minutes`. Value bounds run before rate checks. Rate checks with zero, missing, or invalid durations are skipped and reported.
 
-| Type | Minimum | Maximum | Rate per minute maximum |
-|------|---------|---------|-------------------------|
-| HeartRate | 25, drop | 240, drop | — |
-| HeartRateVariabilitySDNN | 0, drop | 1, drop | — |
-| RespiratoryRate | 0.1, drop | 100, drop | — |
-| OxygenSaturation | 0.50, drop | 1.0, drop | — |
-| EnvironmentalAudioExposure | 0, drop | — | — |
-| HeadphoneAudioExposure | 0, drop | — | — |
-| StepCount | 0, drop | — | 350, cap |
-| AppleExerciseTime | 0, drop | — | — |
-| ActiveEnergyBurned | 0, drop | — | 30, cap |
-| BasalEnergyBurned | 0, drop | — | 10, cap |
-| AppleStandTime | 0, drop | — | — |
-| DistanceCycling | 0, drop | — | 2000, cap |
-| DistanceWalkingRunning | 0, drop | — | 750, cap |
-| FlightsClimbed | 0, drop | 8000, drop | — |
+| Type                       | Minimum    | Maximum    | Rate per minute maximum |
+| -------------------------- | ---------- | ---------- | ----------------------- |
+| HeartRate                  | 25, drop   | 240, drop  | —                       |
+| HeartRateVariabilitySDNN   | 0, drop    | 1, drop    | —                       |
+| RespiratoryRate            | 0.1, drop  | 100, drop  | —                       |
+| OxygenSaturation           | 0.50, drop | 1.0, drop  | —                       |
+| EnvironmentalAudioExposure | 0, drop    | —          | —                       |
+| HeadphoneAudioExposure     | 0, drop    | —          | —                       |
+| StepCount                  | 0, drop    | —          | 350, cap                |
+| AppleExerciseTime          | 0, drop    | —          | —                       |
+| ActiveEnergyBurned         | 0, drop    | —          | 30, cap                 |
+| BasalEnergyBurned          | 0, drop    | —          | 10, cap                 |
+| AppleStandTime             | 0, drop    | —          | —                       |
+| DistanceCycling            | 0, drop    | —          | 2000, cap               |
+| DistanceWalkingRunning     | 0, drop    | —          | 750, cap                |
+| FlightsClimbed             | 0, drop    | 8000, drop | —                       |
 
 To override thresholds:
 
@@ -420,17 +420,17 @@ cleaner = HealthKitCleaner(HKCleanConfig(
 
 Each cleaning step can be independently enabled or disabled via the `ops` dict. Default values are shown below:
 
-| Operation | Default | Description |
-|-----------|---------|-------------|
-| `coerce_numeric` | **on** | Convert the `value` column to numeric; required by most downstream operations |
-| `convert_energy_to_kcal` | **on** | Detect and convert joule-based energy readings to kilocalories |
-| `apply_theory_thresholds` | **on** | Apply configured minimum, maximum, and rate rules independently |
-| `deduplicate` | **on** | Remove exact duplicate rows (same user/type/interval/value) |
-| `normalize_sleep_labels` | **on** | Strip the `HKCategoryValueSleepAnalysis` prefix from sleep values, producing clean labels like `"InBed"`, `"Asleep"`, `"Awake"` |
-| `apply_quantile_filter` | **off** | Drop values outside `quantile_lower`/`quantile_upper` bounds (extra per-type scan) |
-| `apply_watch_device_filter` | **on** | Keep only Apple Watch observations (drops iPhone/iPad sources) |
-| `combine_overlaps` | **on** | Resolves overlapping numeric intervals per user using a sweep-line algorithm. All interval endpoints are collected into atomic time segments; each segment is assigned the "winning" active interval by priority: (1) has `device_source_id` > (2) higher `device_source_id` > (3) shorter duration > (4) later row. For `interval_total` types (activity), the output value is rescaled proportionally to the winning segment's actual duration relative to the original interval's duration. For `interval_level` types (audio), the value is kept as-is. Adjacent segments from the same winning interval are coalesced into one output row. |
-| `combine_overlaps_cat` | **on** | Resolves overlapping categorical intervals (e.g., sleep stages) per user using the same sweep-line boundary approach. Priority when multiple intervals cover the same atomic segment: (1) higher `device_source_id` — only when both intervals have one and they differ > (2) shorter duration — shorter interval assumed more specific > (3) later row. Each atomic segment is assigned the winning interval's label; adjacent segments with the same label are merged into one output row. |
+| Operation                   | Default | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| --------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `coerce_numeric`            | **on**  | Convert the`value` column to numeric; required by most downstream operations                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `convert_energy_to_kcal`    | **on**  | Detect and convert joule-based energy readings to kilocalories                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `apply_theory_thresholds`   | **on**  | Apply configured minimum, maximum, and rate rules independently                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `deduplicate`               | **on**  | Remove exact duplicate rows (same user/type/interval/value)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `normalize_sleep_labels`    | **on**  | Strip the`HKCategoryValueSleepAnalysis` prefix from sleep values, producing clean labels like `"InBed"`, `"Asleep"`, `"Awake"`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `apply_quantile_filter`     | **off** | Drop values outside`quantile_lower`/`quantile_upper` bounds (extra per-type scan)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `apply_watch_device_filter` | **on**  | Keep only Apple Watch observations (drops iPhone/iPad sources)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `combine_overlaps`          | **on**  | Resolves overlapping numeric intervals per user using a sweep-line algorithm. All interval endpoints are collected into atomic time segments; each segment is assigned the "winning" active interval by priority: (1) has`device_source_id` > (2) higher `device_source_id` > (3) shorter duration > (4) later row. For `interval_total` types (activity), the output value is rescaled proportionally to the winning segment's actual duration relative to the original interval's duration. For `interval_level` types (audio), the value is kept as-is. Adjacent segments from the same winning interval are coalesced into one output row. |
+| `combine_overlaps_cat`      | **on**  | Resolves overlapping categorical intervals (e.g., sleep stages) per user using the same sweep-line boundary approach. Priority when multiple intervals cover the same atomic segment: (1) higher`device_source_id` — only when both intervals have one and they differ > (2) shorter duration — shorter interval assumed more specific > (3) later row. Each atomic segment is assigned the winning interval's label; adjacent segments with the same label are merged into one output row.                                                                                                                                                    |
 
 To toggle specific operations:
 
@@ -453,6 +453,7 @@ cleaner = HealthKitCleaner(HKCleanConfig(
 > **Note:** When you provide an `ops` dict, it replaces the entire default dict. Include all keys, or copy the default mapping and change selected entries as shown above.
 
 > **Dependency constraints** (enforced by `validate()`):
+>
 > - `convert_energy_to_kcal`, `apply_theory_thresholds`, and `apply_quantile_filter` require `coerce_numeric=True`.
 
 ### Type routing and cleaning handlers
@@ -495,10 +496,10 @@ There's also a function for creating custom handlers if desired.
 
 When `return_report=True`, the cleaner returns a `(DataFrame, report_dict)` tuple. The report contains:
 
-| Key | Contents |
-|-----|----------|
-| `__global__` | `rows_in`, `rows_out`, `dropped_missing_or_negative_time`, `dropped_missing_type`, `dropped_missing_user_id`, `dropped_invalid_user_id_non_numeric`, `types_seen`, `types_without_handler` |
-| `<TypeName>` | Per-type entry with `rows_in`, `rows_out`, `handler` name, and handler-specific counters such as `min_dropped`, `max_capped`, `rate_per_min_max_capped`, `rate_per_min_max_skipped_invalid_duration`, `deduplicated`, overlap counts, and quantile-filter counts |
+| Key          | Contents                                                                                                                                                                                                                                                        |
+| ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `__global__` | `rows_in`, `rows_out`, `dropped_missing_or_negative_time`, `dropped_missing_type`, `dropped_missing_user_id`, `dropped_invalid_user_id_non_numeric`, `types_seen`, `types_without_handler`                                                                      |
+| `<TypeName>` | Per-type entry with`rows_in`, `rows_out`, `handler` name, and handler-specific counters such as `min_dropped`, `max_capped`, `rate_per_min_max_capped`, `rate_per_min_max_skipped_invalid_duration`, `deduplicated`, overlap counts, and quantile-filter counts |
 
 ---
 
@@ -518,12 +519,12 @@ The aggregator converts cleaned long-form observations into a wide feature matri
 
 ### Scripts
 
-| File | Role |
-|------|------|
-| `healthkit_aggregator.py` | Main aggregator class (`HealthKitAggregator`) with all public methods |
+| File                            | Role                                                                                                                               |
+| ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `healthkit_aggregator.py`       | Main aggregator class (`HealthKitAggregator`) with all public methods                                                              |
 | `healthkit_aggregator_specs.py` | `HKAggConfig`, `AssessmentWindowSpec`, `SleepFeatureSpec`, the type registry, hierarchical rollup specs, and the operator registry |
-| `healthkit_aggregator_time.py` | *Internal* — window construction, timezone schedule building, local-time projection. Used by the aggregator automatically. |
-| `healthkit_hrv.py` | *Internal* — HRV feature computation (time-domain and frequency-domain). Used when `compute_hrv=True`. |
+| `healthkit_aggregator_time.py`  | *Internal* — window construction, timezone schedule building, local-time projection. Used by the aggregator automatically.         |
+| `healthkit_hrv.py`              | *Internal* — HRV feature computation (time-domain and frequency-domain). Used when `compute_hrv=True`.                             |
 
 ### How to use
 
@@ -536,11 +537,11 @@ wide, report, aux = aggregator.run_aggregation(cleaned_df)
 
 `run_aggregation` returns three objects:
 
-| Return value | Description |
-|--------------|-------------|
-| `wide` | DataFrame with one row per `(user_id, window_id)`. Feature columns are named `<Type>__<stat>` (e.g., `HeartRate__mean`, `StepCount__sum`). Also includes `window_start`, `window_end`, `window_seconds`, and (depending on `output_timezone`) UTC and/or local timestamp columns. |
-| `report` | Nested dict with sections: `input` (normalization counts), `bins` (window counts per user), `wear` (watch-on rates), `fills` (zero-fill counts by column), `qc` (dropped/masked counts), `timing`, and `config_snapshot` (full config as a dict). |
-| `aux` | Dict of supporting artifacts: `windows`, `win_wear`, `day_wear`, `participant_wear`, `presence`, `schedule`, and `daily_sleep` (empty unless requested). Pass `aux` to `apply_quality_control`. |
+| Return value | Description                                                                                                                                                                                                                                                                      |
+| ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `wide`       | DataFrame with one row per`(user_id, window_id)`. Feature columns are named `<Type>__<stat>` (e.g., `HeartRate__mean`, `StepCount__sum`). Also includes `window_start`, `window_end`, `window_seconds`, and (depending on `output_timezone`) UTC and/or local timestamp columns. |
+| `report`     | Nested dict with sections:`input` (normalization counts), `bins` (window counts per user), `wear` (watch-on rates), `fills` (zero-fill counts by column), `qc` (dropped/masked counts), `timing`, and `config_snapshot` (full config as a dict).                                 |
+| `aux`        | Dict of supporting artifacts:`windows`, `win_wear`, `day_wear`, `participant_wear`, `presence`, `schedule`, and `daily_sleep` (empty unless requested). Pass `aux` to `apply_quality_control`.                                                                                   |
 
 ### Configuration (`HKAggConfig`)
 
@@ -560,22 +561,22 @@ You may also simply change the default values in `healthkit_aggregator_specs.py`
 
 #### Time and binning
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `bin_size` | str | `"1H"` | Window width as a pandas frequency string (e.g., `"1H"`, `"30min"`, `"1D"`) |
-| `bin_origin` | str | `"00:00:00"` | Time-of-day that windows align to (e.g., `"00:00:00"` = midnight) |
-| `tz_mode_l0` | str | `"utc"` | `"utc"` bins by UTC timestamps; `"local"` bins by local wall-clock time |
-| `output_timezone` | str | `"both"` | Which timestamps appear in the output: `"UTC"`, `"local"`, or `"both"` |
+| Field             | Type | Default      | Description                                                                |
+| ----------------- | ---- | ------------ | -------------------------------------------------------------------------- |
+| `bin_size`        | str  | `"1H"`       | Window width as a pandas frequency string (e.g.,`"1H"`, `"30min"`, `"1D"`) |
+| `bin_origin`      | str  | `"00:00:00"` | Time-of-day that windows align to (e.g.,`"00:00:00"` = midnight)           |
+| `tz_mode_l0`      | str  | `"utc"`      | `"utc"` bins by UTC timestamps; `"local"` bins by local wall-clock time    |
+| `output_timezone` | str  | `"both"`     | Which timestamps appear in the output:`"UTC"`, `"local"`, or `"both"`      |
 
 #### Assessment lookback windows
 
 Assessment aggregation requires an `assessments` DataFrame with unique, nonmissing `(user_id, assessment_id)` pairs and a UTC-coercible `anchor_time`, plus one `AssessmentWindowSpec`. The spec rejects fields that are missing or irrelevant for its mode.
 
-| Mode | Required fields | Exact behavior |
-|------|-----------------|----------------|
-| `whole_lookback` | `duration_before` | One window from `anchor_time - duration_before` through the assessment. |
-| `split_lookback` | `duration_before`, `n_bins` | Divides the full assessment-relative lookback into `n_bins` equal windows. |
-| `aligned_grid` | `n_bins`, `bin_size`; optional `bin_origin`, `tz_mode` | Selects the last `n_bins` canonical bins and truncates only the terminal bin when the assessment is off-grid. An assessment exactly on a boundary receives `n_bins` complete preceding bins. |
+| Mode             | Required fields                                        | Exact behavior                                                                                                                                                                              |
+| ---------------- | ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `whole_lookback` | `duration_before`                                      | One window from`anchor_time - duration_before` through the assessment.                                                                                                                      |
+| `split_lookback` | `duration_before`, `n_bins`                            | Divides the full assessment-relative lookback into`n_bins` equal windows.                                                                                                                   |
+| `aligned_grid`   | `n_bins`, `bin_size`; optional `bin_origin`, `tz_mode` | Selects the last`n_bins` canonical bins and truncates only the terminal bin when the assessment is off-grid. An assessment exactly on a boundary receives `n_bins` complete preceding bins. |
 
 Assessment windows carry `assessment_id`, `anchor_time`, and zero-based `bin_in_lookback`. `window_id` is an independent internal key, and `window_seconds` records the actual duration of a shortened terminal bin. Assessment windows do not use `bin_index`.
 
@@ -611,24 +612,24 @@ With a UTC hourly grid, this example produces 14:00–15:00, 15:00–16:00, 16:0
 
 Watch wear is derived from heart rate coverage: if HR data covers at least `bin_frac_min` of a window, that window is marked as "watch on."
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `hr_type` | str | `"HeartRate"` | HealthKit type used to detect watch wear |
-| `hr_coverage_window_seconds` | int | `300` | Sliding window size (seconds) for HR coverage calculation |
-| `bin_frac_min` | float or None | `0.80` | Min fraction of a window with HR data to count as "watch on" (0.0–1.0). `None` to disable. |
-| `day_frac_min` | float or None | `None` | Min fraction of a day's windows with watch wear for the day to be valid. `None` to disable. |
-| `overall_frac_min` | float or None | `None` | Min overall participant wear fraction. `None` to disable. |
+| Field                        | Type          | Default       | Description                                                                                |
+| ---------------------------- | ------------- | ------------- | ------------------------------------------------------------------------------------------ |
+| `hr_type`                    | str           | `"HeartRate"` | HealthKit type used to detect watch wear                                                   |
+| `hr_coverage_window_seconds` | int           | `300`         | Sliding window size (seconds) for HR coverage calculation                                  |
+| `bin_frac_min`               | float or None | `0.80`        | Min fraction of a window with HR data to count as "watch on" (0.0–1.0).`None` to disable.  |
+| `day_frac_min`               | float or None | `None`        | Min fraction of a day's windows with watch wear for the day to be valid.`None` to disable. |
+| `overall_frac_min`           | float or None | `None`        | Min overall participant wear fraction.`None` to disable.                                   |
 
 #### Quality control
 
 QC can drop or mask rows at three levels. All three are disabled by default. Enable them and call `apply_quality_control(wide, aux)` after aggregation.
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `enable_bin_qc` | bool | `False` | Apply QC at the window (bin) level |
-| `enable_day_qc` | bool | `False` | Apply QC at the day level |
-| `enable_participant_qc` | bool | `False` | Apply QC at the participant level |
-| `qc_action` | str | `"drop"` | `"drop"` removes rows failing QC; `"mask"` sets feature values to NaN |
+| Field                   | Type | Default  | Description                                                           |
+| ----------------------- | ---- | -------- | --------------------------------------------------------------------- |
+| `enable_bin_qc`         | bool | `False`  | Apply QC at the window (bin) level                                    |
+| `enable_day_qc`         | bool | `False`  | Apply QC at the day level                                             |
+| `enable_participant_qc` | bool | `False`  | Apply QC at the participant level                                     |
+| `qc_action`             | str  | `"drop"` | `"drop"` removes rows failing QC; `"mask"` sets feature values to NaN |
 
 ```python
 # Apply QC after aggregation
@@ -637,16 +638,16 @@ wide_qc, report_qc = aggregator.apply_quality_control(wide, aux)
 
 #### Pruning
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `early_prune_mode` | str or None | `"any_data"` | Drop empty windows early to save memory. `"any_data"` keeps windows with any observations; `"wear_seconds_gt0"` keeps windows with watch wear > 0; `"any_non_watch_data"` keeps windows with non-watch data; `"none"` / `None` keeps all windows. |
-| `prune_empty_rows` | bool | `True` | Remove rows with all feature values missing after QC/masking |
+| Field              | Type        | Default      | Description                                                                                                                                                                                                                                      |
+| ------------------ | ----------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `early_prune_mode` | str or None | `"any_data"` | Drop empty windows early to save memory.`"any_data"` keeps windows with any observations; `"wear_seconds_gt0"` keeps windows with watch wear > 0; `"any_non_watch_data"` keeps windows with non-watch data; `"none"` / `None` keeps all windows. |
+| `prune_empty_rows` | bool        | `True`       | Remove rows with all feature values missing after QC/masking                                                                                                                                                                                     |
 
 #### Zero fill
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `apply_zero_fill` | bool | `False` | Enables the per-statistic `zero_fill_rules` in the type registry. No granular values are filled by default. |
+| Field                     | Type | Default | Description                                                                                                                                   |
+| ------------------------- | ---- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `apply_zero_fill`         | bool | `False` | Enables the per-statistic`zero_fill_rules` in the type registry. No granular values are filled by default.                                    |
 | `apply_sleep_qc_fill_nan` | bool | `False` | When enabled, apply_sleep_quality_control() will fill missing daily sleep stage/category aggregates with zeros when sleep duration is present |
 
 Each granular rule has an independent gate, fill value, and availability policy:
@@ -670,23 +671,22 @@ step_count_registry = {
 
 `participant_evidence` requires evidence in the complete validated input, before window pruning, that the participant produces the type. Fine-grained sleep labels require the exact label; sleep unions require any constituent label. `assume_available` explicitly permits filling without participant evidence. The gate must also pass. This keeps a stream that the participant's device never emits as NaN while allowing explicit zero semantics for streams known to be available.
 
-
 #### HRV
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `compute_hrv` | bool | `False` | Compute heart rate variability features from HeartRate data |
-| `hrv_time_domain` | bool | `True` | Compute time-domain HRV metrics (SDNN, RMSSD, pNN50, pNN20, TriangularIndex) |
-| `hrv_freq_domain` | bool | `True` | Compute frequency-domain HRV metrics (VLF, LF, HF power, LF/HF ratio). Requires `scipy`. |
-| `hrv_min_samples` | int | `10` | Min HeartRate samples per window for time-domain HRV |
-| `hrv_freq_min_samples` | int | `30` | Min HeartRate samples per window for frequency-domain HRV |
-| `hrv_interpolation_fs` | float | `4.0` | Interpolation sampling rate (Hz) for frequency-domain HRV |
+| Field                  | Type  | Default | Description                                                                             |
+| ---------------------- | ----- | ------- | --------------------------------------------------------------------------------------- |
+| `compute_hrv`          | bool  | `False` | Compute heart rate variability features from HeartRate data                             |
+| `hrv_time_domain`      | bool  | `True`  | Compute time-domain HRV metrics (SDNN, RMSSD, pNN50, pNN20, TriangularIndex)            |
+| `hrv_freq_domain`      | bool  | `True`  | Compute frequency-domain HRV metrics (VLF, LF, HF power, LF/HF ratio). Requires`scipy`. |
+| `hrv_min_samples`      | int   | `10`    | Min HeartRate samples per window for time-domain HRV                                    |
+| `hrv_freq_min_samples` | int   | `30`    | Min HeartRate samples per window for frequency-domain HRV                               |
+| `hrv_interpolation_fs` | float | `4.0`   | Interpolation sampling rate (Hz) for frequency-domain HRV                               |
 
 #### Parallelism
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `max_workers` | int or None | `None` | Thread pool size for parallel observation assignment. `None` auto-detects CPU count. |
+| Field         | Type        | Default | Description                                                                         |
+| ------------- | ----------- | ------- | ----------------------------------------------------------------------------------- |
+| `max_workers` | int or None | `None`  | Thread pool size for parallel observation assignment.`None` auto-detects CPU count. |
 
 ### Type registry
 
@@ -698,25 +698,25 @@ To modify the registry, call `build_default_type_registry()`, edit the dict, and
 
 Values represent totals accumulated across an interval (e.g., total steps). The aggregator sums values proportionally when intervals overlap window boundaries.
 
-| Type | Aggregates | Device class |
-|------|------------|--------------|
-| StepCount | `sum`, `duration`, `rate_per_min`, continuity indicators | either |
-| DistanceCycling | `sum`, `duration`, `rate_per_min`, continuity indicators | either |
-| DistanceWalkingRunning | `sum`, `duration`, `rate_per_min`, continuity indicators | either |
-| FlightsClimbed | `sum`, `duration`, `rate_per_min`, continuity indicators | either |
-| ActiveEnergyBurned | `sum`, `duration`, `rate_per_min`, continuity indicators | either |
-| BasalEnergyBurned | `sum`, `duration`, `rate_per_min`, continuity indicators | either |
-| AppleExerciseTime | `sum`, continuity indicators | either |
-| AppleStandTime | `sum`, continuity indicators | either |
+| Type                   | Aggregates                                               | Device class |
+| ---------------------- | -------------------------------------------------------- | ------------ |
+| StepCount              | `sum`, `duration`, `rate_per_min`, continuity indicators | either       |
+| DistanceCycling        | `sum`, `duration`, `rate_per_min`, continuity indicators | either       |
+| DistanceWalkingRunning | `sum`, `duration`, `rate_per_min`, continuity indicators | either       |
+| FlightsClimbed         | `sum`, `duration`, `rate_per_min`, continuity indicators | either       |
+| ActiveEnergyBurned     | `sum`, `duration`, `rate_per_min`, continuity indicators | either       |
+| BasalEnergyBurned      | `sum`, `duration`, `rate_per_min`, continuity indicators | either       |
+| AppleExerciseTime      | `sum`, continuity indicators                             | either       |
+| AppleStandTime         | `sum`, continuity indicators                             | either       |
 
 #### Interval level types
 
 Values represent a sustained level across an interval (e.g., dB exposure). The aggregator computes time-weighted statistics.
 
-| Type | Aggregates | Special aggregates | Device class |
-|------|------------|-------------------|--------------|
-| EnvironmentalAudioExposure | `leq`, `energy_seconds`, `time_weighted_mean`, `max`, `duration`, `median`, `median_duration`, `count`, continuity indicators | `p95` (95th percentile), `time_above_85` (seconds above 85 dB) | either |
-| HeadphoneAudioExposure | `leq`, `energy_seconds`, `time_weighted_mean`, `max`, `duration`, `median`, `median_duration`, `count`, continuity indicators | `p95`, `time_above_85` | non_watch_exclusive |
+| Type                       | Aggregates                                                                                                                    | Special aggregates                                             | Device class        |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- | ------------------- |
+| EnvironmentalAudioExposure | `leq`, `energy_seconds`, `time_weighted_mean`, `max`, `duration`, `median`, `median_duration`, `count`, continuity indicators | `p95` (95th percentile), `time_above_85` (seconds above 85 dB) | either              |
+| HeadphoneAudioExposure     | `leq`, `energy_seconds`, `time_weighted_mean`, `max`, `duration`, `median`, `median_duration`, `count`, continuity indicators | `p95`, `time_above_85`                                         | non_watch_exclusive |
 
 Special aggregates are defined in `special_aggregates`; add their names to the type's `aggregates` tuple when you want them emitted.
 
@@ -724,21 +724,21 @@ Special aggregates are defined in `special_aggregates`; add their names to the t
 
 Instantaneous measurements (e.g., a single heart rate reading at a point in time).
 
-| Type | Aggregates | Special aggregates | Device class |
-|------|------------|-------------------|--------------|
-| HeartRate | `mean`, `median`, `std`, `max`, `min`, `count` | — | watch_exclusive |
-| HeartRateVariabilitySDNN | `mean`, `median`, `std`, `max`, `min`, `count` | `p75` (75th percentile) | watch_exclusive |
-| RespiratoryRate | `mean`, `median`, `std`, `max`, `min`, `count` | — | watch_exclusive |
-| OxygenSaturation | `mean`, `median`, `std`, `max`, `min`, `count` | `pct_below_92` (% below 92) | watch_exclusive |
+| Type                     | Aggregates                                     | Special aggregates          | Device class    |
+| ------------------------ | ---------------------------------------------- | --------------------------- | --------------- |
+| HeartRate                | `mean`, `median`, `std`, `max`, `min`, `count` | —                           | watch_exclusive |
+| HeartRateVariabilitySDNN | `mean`, `median`, `std`, `max`, `min`, `count` | `p75` (75th percentile)     | watch_exclusive |
+| RespiratoryRate          | `mean`, `median`, `std`, `max`, `min`, `count` | —                           | watch_exclusive |
+| OxygenSaturation         | `mean`, `median`, `std`, `max`, `min`, `count` | `pct_below_92` (% below 92) | watch_exclusive |
 
 #### Categorical interval types
 
 Labeled time intervals (e.g., sleep stages). The continuity indicators are 1 only when the original interval extends strictly across the relevant boundary. An interval that starts or ends exactly on a boundary has indicator 0.
 
-| Type | Aggregates (per label) | Device class |
-|------|----------------------|--------------|
-| SleepAnalysis | Configurable `sum`, `mean`, `count`, `continues_from_previous_bin`, and `continues_into_next_bin` for nine exact labels and three unions | either |
-| EnvironmentalAudioExposureEvent | Duration, count, and continuity for `momentary_limit` | either |
+| Type                            | Aggregates (per label)                                                                                                                  | Device class |
+| ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- | ------------ |
+| SleepAnalysis                   | Configurable`sum`, `mean`, `count`, `continues_from_previous_bin`, and `continues_into_next_bin` for nine exact labels and three unions | either       |
+| EnvironmentalAudioExposureEvent | Duration, count, and continuity for`momentary_limit`                                                                                    | either       |
 
 `SleepFeatureSpec()` emits all 60 granular sleep features by default: five statistics for each of nine normalized labels and five statistics for each of the `in_bed`, `asleep`, and `awake` unions. `AwakeUnspecified` belongs to both the asleep and awake unions. To request a smaller deterministic schema:
 
@@ -824,44 +824,44 @@ Output has one row per `(user_id, sleep_date)` or `(user_id, assessment_id, slee
 
 **Identifiers**
 
-| Column | Description |
-|---|---|
-| `user_id` | Participant identifier carried through from the input. |
-| `assessment_id` | Present for assessment-specific daily rows. |
-| `sleep_date` | Local calendar date on which the 15:00-anchored sleep day ends. |
+| Column          | Description                                                     |
+| --------------- | --------------------------------------------------------------- |
+| `user_id`       | Participant identifier carried through from the input.          |
+| `assessment_id` | Present for assessment-specific daily rows.                     |
+| `sleep_date`    | Local calendar date on which the 15:00-anchored sleep day ends. |
 
 **Durations and timing (hours)**
 
-| Column | Description |
-|---|---|
-| `sleep_bedrest_duration_day` | Total time in bed — sum of durations of all in-bed-category segments on the day. |
-| `sleep_sleep_duration_day` | Total sleep time (TST) — sum of durations of all asleep-category segments. |
-| `sleep_awake_duration_day` | Total time labeled `Awake`/`AwakeUnspecified` during the in-bed window. |
-| `sleep_wake_after_sleep_onset_day` | Sum of complete awake-category records starting at or after first sleep onset and ending no later than the last sleep offset. |
-| `sleep_sleep_onset_latency_day` | Time from bedrest onset to first sleep onset. |
-| `sleep_first_bedrest_start_hours_day` | Clock hour of the first in-bed record's start, expressed relative to the prior local midnight; values above 24 cross midnight. |
-| `sleep_last_bedrest_end_hours_day` | Clock hour of the last in-bed record's end. |
-| `sleep_first_onset_hours_day` | Clock hour of the first asleep record's start. |
-| `sleep_last_offset_hours_day` | Clock hour of the last asleep record's end. |
-| `sleep_day_elapsed_fraction` | 1 for a complete historical sleep day; otherwise the fraction of the assessment-containing 15:00 day elapsed at the assessment. |
+| Column                                | Description                                                                                                                     |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `sleep_bedrest_duration_day`          | Total time in bed — sum of durations of all in-bed-category segments on the day.                                                |
+| `sleep_sleep_duration_day`            | Total sleep time (TST) — sum of durations of all asleep-category segments.                                                      |
+| `sleep_awake_duration_day`            | Total time labeled`Awake`/`AwakeUnspecified` during the in-bed window.                                                          |
+| `sleep_wake_after_sleep_onset_day`    | Sum of complete awake-category records starting at or after first sleep onset and ending no later than the last sleep offset.   |
+| `sleep_sleep_onset_latency_day`       | Time from bedrest onset to first sleep onset.                                                                                   |
+| `sleep_first_bedrest_start_hours_day` | Clock hour of the first in-bed record's start, expressed relative to the prior local midnight; values above 24 cross midnight.  |
+| `sleep_last_bedrest_end_hours_day`    | Clock hour of the last in-bed record's end.                                                                                     |
+| `sleep_first_onset_hours_day`         | Clock hour of the first asleep record's start.                                                                                  |
+| `sleep_last_offset_hours_day`         | Clock hour of the last asleep record's end.                                                                                     |
+| `sleep_day_elapsed_fraction`          | 1 for a complete historical sleep day; otherwise the fraction of the assessment-containing 15:00 day elapsed at the assessment. |
 
 **Quality and context**
 
-| Column | Description |
-|---|---|
-| `sleep_efficiency_day` | `sleep_duration / bedrest_duration`, clipped to [0, 1]; 0 is coerced to NaN. |
-| `sleep_sleep_hr_median_day` | Median `HeartRate` among point samples that fall inside at least one actual asleep-category record. BPM. |
-| `sleep_sleep_hrv_median_day` | Median `HeartRateVariabilitySDNN` among point samples inside actual asleep-category records. |
-| `sleep_bedrest_audio_median_day` | Median `EnvironmentalAudioExposure` among samples inside actual in-bed-category records. No LEQ substitution is applied. |
+| Column                           | Description                                                                                                             |
+| -------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `sleep_efficiency_day`           | `sleep_duration / bedrest_duration`, clipped to [0, 1]; 0 is coerced to NaN.                                            |
+| `sleep_sleep_hr_median_day`      | Median`HeartRate` among point samples that fall inside at least one actual asleep-category record. BPM.                 |
+| `sleep_sleep_hrv_median_day`     | Median`HeartRateVariabilitySDNN` among point samples inside actual asleep-category records.                             |
+| `sleep_bedrest_audio_median_day` | Median`EnvironmentalAudioExposure` among samples inside actual in-bed-category records. No LEQ substitution is applied. |
 
 **Per-stage statistics**
 For each sleep-analysis label `<stage>` observed anywhere in the supplied dataset, three columns are emitted. The daily stage schema is therefore data-dependent, while the core daily columns are fixed.
 
-| Column pattern | Description |
-|---|---|
-| `sleep_<stage>_sum_day` | Total duration of segments with this label (hours). |
-| `sleep_<stage>_mean_day` | Mean segment duration for this label (hours). |
-| `sleep_<stage>_count_day` | Number of segments with this label. |
+| Column pattern            | Description                                         |
+| ------------------------- | --------------------------------------------------- |
+| `sleep_<stage>_sum_day`   | Total duration of segments with this label (hours). |
+| `sleep_<stage>_mean_day`  | Mean segment duration for this label (hours).       |
+| `sleep_<stage>_count_day` | Number of segments with this label.                 |
 
 Stage columns only appear when that label is present in the input, so the exact column set varies by device and participant (e.g., watchOS ≥ 9 devices emit `AsleepCore`/`AsleepDeep`/`AsleepREM`; older sources emit only `Asleep`).
 
@@ -890,15 +890,15 @@ For deep learning, `aligned_grid` usually provides the clearest sequence represe
 
 The `report` dict from `run_aggregation` contains:
 
-| Section | Contents |
-|---------|----------|
-| `input` | Normalization counts: ambiguous local times inferred, nonexistent times shifted, invalid user IDs dropped, split expansion factor |
-| `bins` | `bin_seconds_nominal`, `bin_origin_utc`, `counts_per_user` (dict of user_id → window count), `non_empty_bin_counts_by_type`, `early_pruned_bins` |
-| `wear` | `bin_seconds_worn_total`, `bin_watch_on_rate`, `day_valid_rate`, `participant_overall_frac_mean`, `day_valid_counts`, `participant_valid_counts` |
-| `fills` | `counts_by_column` — number of values zero-filled per feature column |
-| `daily_sleep` | Daily row count and the exact daily feature columns produced when `include_daily_sleep=True` |
-| `qc` | `dropped_counts` and `masked_counts` at bin/day/participant levels, `pruned_empty_rows` |
-| `config_snapshot` | Full `HKAggConfig` as a dict (for reproducibility) |
+| Section           | Contents                                                                                                                                         |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `input`           | Normalization counts: ambiguous local times inferred, nonexistent times shifted, invalid user IDs dropped, split expansion factor                |
+| `bins`            | `bin_seconds_nominal`, `bin_origin_utc`, `counts_per_user` (dict of user_id → window count), `non_empty_bin_counts_by_type`, `early_pruned_bins` |
+| `wear`            | `bin_seconds_worn_total`, `bin_watch_on_rate`, `day_valid_rate`, `participant_overall_frac_mean`, `day_valid_counts`, `participant_valid_counts` |
+| `fills`           | `counts_by_column` — number of values zero-filled per feature column                                                                             |
+| `daily_sleep`     | Daily row count and the exact daily feature columns produced when`include_daily_sleep=True`                                                      |
+| `qc`              | `dropped_counts` and `masked_counts` at bin/day/participant levels, `pruned_empty_rows`                                                          |
+| `config_snapshot` | Full`HKAggConfig` as a dict (for reproducibility)                                                                                                |
 
 ---
 

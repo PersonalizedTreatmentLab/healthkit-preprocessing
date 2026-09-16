@@ -92,7 +92,13 @@ class SleepFeatureSpec:
 
 @dataclass(frozen=True)
 class AssessmentWindowSpec:
-    """Define how lookback windows are constructed for each assessment."""
+    """Define how lookback windows are constructed for each assessment.
+
+    ``aligned_grid`` requires ``bin_size`` and exactly one lookback definition:
+    ``n_bins`` selects a fixed number of canonical bins, whereas
+    ``duration_before`` clips the first and final bins to cover an exact elapsed
+    duration before the assessment.
+    """
 
     mode: Literal["whole_lookback", "split_lookback", "aligned_grid"]
     duration_before: Optional[Any] = None
@@ -116,12 +122,14 @@ class AssessmentWindowSpec:
         required = {
             "whole_lookback": {"duration_before"},
             "split_lookback": {"duration_before", "n_bins"},
-            "aligned_grid": {"n_bins", "bin_size"},
+            "aligned_grid": {"bin_size"},
         }[self.mode]
         allowed = {
             "whole_lookback": {"duration_before"},
             "split_lookback": {"duration_before", "n_bins"},
-            "aligned_grid": {"n_bins", "bin_size", "bin_origin", "tz_mode"},
+            "aligned_grid": {
+                "duration_before", "n_bins", "bin_size", "bin_origin", "tz_mode"
+            },
         }[self.mode]
         missing = required - populated
         irrelevant = populated - allowed
@@ -129,6 +137,13 @@ class AssessmentWindowSpec:
             raise ValueError(
                 f"AssessmentWindowSpec(mode={self.mode!r}) has "
                 f"missing={sorted(missing)} irrelevant={sorted(irrelevant)}"
+            )
+
+        if self.mode == "aligned_grid" and (
+            (self.duration_before is None) == (self.n_bins is None)
+        ):
+            raise ValueError(
+                "aligned_grid requires exactly one of duration_before or n_bins"
             )
 
         if self.duration_before is not None:

@@ -700,7 +700,12 @@ def build_assessment_windows(
                     "assessment_order": assessment.assessment_order,
                 })
     else:
-        n_bins = int(window_spec.n_bins)
+        n_bins = int(window_spec.n_bins) if window_spec.n_bins is not None else None
+        duration = (
+            pd.to_timedelta(window_spec.duration_before)
+            if window_spec.duration_before is not None
+            else None
+        )
         step = pd.to_timedelta(window_spec.bin_size)
         origin = pd.to_timedelta(
             default_bin_origin if window_spec.bin_origin is None else window_spec.bin_origin
@@ -710,15 +715,37 @@ def build_assessment_windows(
             epoch_anchor = pd.Timestamp("1970-01-01", tz="UTC") + origin
             step_ns = int(step.value)
             for assessment in a.itertuples(index=False):
-                delta_ns = int(assessment.anchor_time.value - epoch_anchor.value)
-                on_boundary = delta_ns % step_ns == 0
-                terminal_start = epoch_anchor + (
-                    (delta_ns // step_ns) - int(on_boundary)
-                ) * step
-                first_start = terminal_start - (n_bins - 1) * step
-                for bin_number in range(n_bins):
-                    start = first_start + bin_number * step
-                    end = min(start + step, assessment.anchor_time)
+                if duration is None:
+                    delta_ns = int(assessment.anchor_time.value - epoch_anchor.value)
+                    on_boundary = delta_ns % step_ns == 0
+                    terminal_start = epoch_anchor + (
+                        (delta_ns // step_ns) - int(on_boundary)
+                    ) * step
+                    first_start = terminal_start - (n_bins - 1) * step
+                    boundaries = [
+                        (first_start + bin_number * step,
+                         min(first_start + (bin_number + 1) * step, assessment.anchor_time))
+                        for bin_number in range(n_bins)
+                    ]
+                else:
+                    lookback_start = assessment.anchor_time - duration
+                    first_index = int(
+                        (lookback_start.value - epoch_anchor.value) // step_ns
+                    )
+                    stop_index = int(
+                        (assessment.anchor_time.value - epoch_anchor.value + step_ns - 1)
+                        // step_ns
+                    )
+                    boundaries = []
+                    for grid_index in range(first_index, stop_index):
+                        grid_start = epoch_anchor + grid_index * step
+                        grid_end = grid_start + step
+                        start = max(grid_start, lookback_start)
+                        end = min(grid_end, assessment.anchor_time)
+                        if end > start:
+                            boundaries.append((start, end))
+
+                for bin_number, (start, end) in enumerate(boundaries):
                     rows.append({
                         "user_id": assessment.user_id,
                         "assessment_id": assessment.assessment_id,
@@ -744,9 +771,14 @@ def build_assessment_windows(
             ).copy()
             sch_for_grid["user_id"] = sch_for_grid["user_id"].astype("int64")
             for assessment in a.itertuples(index=False):
+                lookback_start = (
+                    assessment.anchor_time - duration
+                    if duration is not None
+                    else None
+                )
                 candidate_start = (
                     assessment.anchor_time
-                    - n_bins * step
+                    - (duration if duration is not None else n_bins * step)
                     - pd.Timedelta(days=2)
                 )
                 candidate_end = assessment.anchor_time + step
@@ -780,20 +812,59 @@ def build_assessment_windows(
                 candidates = candidates.loc[
                     candidates["bin_start"] < assessment.anchor_time
                 ].sort_values(["bin_start", "bin_end"])
-                candidates = candidates.drop_duplicates("bin_start", keep="last").tail(n_bins)
-                if len(candidates) != n_bins:
-                    raise ValueError(
-                        f"schedule does not provide {n_bins} aligned local bins for "
-                        f"assessment {assessment.assessment_id!r}"
+                candidates = candidates.drop_duplicates("bin_start", keep="last")
+                if duration is None:
+                    candidates = candidates.tail(n_bins)
+                    if len(candidates) != n_bins:
+                        raise ValueError(
+                            f"schedule does not provide {n_bins} aligned local bins for "
+                            f"assessment {assessment.assessment_id!r}"
+                        )
+                else:
+                    candidates = candidates.loc[
+                        candidates["bin_end"] > lookback_start
+                    ]
+
+                boundaries = []
+                for candidate in candidates.itertuples(index=False):
+                    start = (
+                        max(candidate.bin_start, lookback_start)
+                        if lookback_start is not None
+                        else candidate.bin_start
                     )
-                for bin_number, candidate in enumerate(candidates.itertuples(index=False)):
+                    end = min(candidate.bin_end, assessment.anchor_time)
+                    if end <= start:
+                        continue
+                    boundaries.append((start, end))
+
+                if duration is not None:
+                    is_contiguous = all(
+                        previous_end == next_start
+                        for (_, previous_end), (next_start, _) in zip(
+                            boundaries, boundaries[1:]
+                        )
+                    )
+                    spans_requested_interval = (
+                        bool(boundaries)
+                        and boundaries[0][0] == lookback_start
+                        and boundaries[-1][1] == assessment.anchor_time
+                        and is_contiguous
+                    )
+                    if not spans_requested_interval:
+                        raise ValueError(
+                            "schedule does not provide aligned local bins spanning "
+                            "the full exact-duration interval for assessment "
+                            f"{assessment.assessment_id!r}"
+                        )
+
+                for bin_number, (start, end) in enumerate(boundaries):
                     rows.append({
                         "user_id": assessment.user_id,
                         "assessment_id": assessment.assessment_id,
                         "anchor_time": assessment.anchor_time,
                         "bin_in_lookback": bin_number,
-                        "window_start": candidate.bin_start,
-                        "window_end": min(candidate.bin_end, assessment.anchor_time),
+                        "window_start": start,
+                        "window_end": end,
                         "assessment_order": assessment.assessment_order,
                     })
 
@@ -848,7 +919,19 @@ def build_assessment_windows(
     report.setdefault("bins", {})
     report["bins"]["window_kind"] = "anchored"
     report["bins"]["assessment_window_mode"] = window_spec.mode
-    report["bins"]["n_bins_per_assessment"] = n_bins
+    if window_spec.mode == "aligned_grid" and window_spec.duration_before is not None:
+        actual_counts = windows.groupby(["user_id", "assessment_id"]).size()
+        report["bins"]["lookback_seconds"] = float(
+            pd.to_timedelta(window_spec.duration_before).total_seconds()
+        )
+        report["bins"]["actual_bins_per_assessment_min"] = int(actual_counts.min())
+        report["bins"]["actual_bins_per_assessment_max"] = int(actual_counts.max())
+        report["bins"].pop("n_bins_per_assessment", None)
+    else:
+        report["bins"].pop("lookback_seconds", None)
+        report["bins"].pop("actual_bins_per_assessment_min", None)
+        report["bins"].pop("actual_bins_per_assessment_max", None)
+        report["bins"]["n_bins_per_assessment"] = n_bins
     report.setdefault("windows", {})["overlap_stats"] = compute_window_overlap_depth_stats(windows)
     report.setdefault("windows", {})["schedule_coverage_fraction_lt1"] = int((windows["schedule_covered_fraction"] < 1.0).sum())
 
