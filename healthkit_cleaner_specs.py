@@ -64,7 +64,9 @@ class HKCleanConfig:
             "min": {"limit": 0, "action": "drop"},
             "rate_per_min_max": {"limit": 350, "action": "cap"},
         },
-        "AppleExerciseTime": {"min": {"limit": 0, "action": "drop"}},
+        "AppleExerciseTime": {
+            "min": {"limit": 0, "action": "drop"},
+        },
         "ActiveEnergyBurned": {
             "min": {"limit": 0, "action": "drop"},
             "rate_per_min_max": {"limit": 30, "action": "cap"},
@@ -73,32 +75,33 @@ class HKCleanConfig:
             "min": {"limit": 0, "action": "drop"},
             "rate_per_min_max": {"limit": 10, "action": "cap"},
         },
-        "AppleStandTime": {"min": {"limit": 0, "action": "drop"}},
+        "AppleStandTime": {
+            "min": {"limit": 0, "action": "drop"},
+        },
         "DistanceCycling": {
             "min": {"limit": 0, "action": "drop"},
-            "rate_per_min_max": {"limit": 2000, "action": "cap"},
+            "rate_per_min_max": {"limit": 5500, "action": "cap"},
         },
         "DistanceWalkingRunning": {
             "min": {"limit": 0, "action": "drop"},
-            "rate_per_min_max": {"limit": 750, "action": "cap"},
+            "rate_per_min_max": {"limit": 800, "action": "cap"},
         },
         "FlightsClimbed": {
             "min": {"limit": 0, "action": "drop"},
-            "max": {"limit": 8000, "action": "drop"},
         },
 
         # Vitals
         "HeartRate": {
-            "min": {"limit": 25, "action": "drop"},
-            "max": {"limit": 240, "action": "drop"},
+            "min": {"limit": 30, "action": "drop"},
+            "max": {"limit": 210, "action": "drop"},
         },
         "HeartRateVariabilitySDNN": {
             "min": {"limit": 0, "action": "drop"},
-            "max": {"limit": 1, "action": "drop"},
+            "max": {"limit": 0.300, "action": "drop"},
         },
         "RespiratoryRate": {
             "min": {"limit": 0.1, "action": "drop"},
-            "max": {"limit": 100, "action": "drop"},
+            "max": {"limit": 65, "action": "drop"},
         },
         "OxygenSaturation": {
             "min": {"limit": 0.50, "action": "drop"},
@@ -140,6 +143,10 @@ class HKCleanConfig:
     def validate(self):
         """Validate the configured values."""
         _validate_clean_config(self)
+
+
+
+
 
 # =============================================================================
 # INTERNAL IMPLEMENTATION — NO ROUTINE CONFIGURATION BELOW THIS LINE

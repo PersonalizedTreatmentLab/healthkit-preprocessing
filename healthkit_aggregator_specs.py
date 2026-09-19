@@ -54,7 +54,7 @@ class HKAggConfig:
     # Timezone schedule inference
     # -------------------------------------------------------------------------
     tz_policy: Literal["strict", "lenient"] = "strict"
-    utc_schedule_inference_policy: Literal["skip", "infer_fallback", "infer_fail"] = "infer_fallback"
+    utc_schedule_inference_policy: Literal["skip", "infer_fallback", "infer_fail"] = "infer_fail"
     schedule_point_policy: Literal["include_epsilon", "exclude"] = "include_epsilon"
     schedule_point_epsilon: str = "1ns"
     schedule_invalid_tz_policy: Literal["strict", "coerce_default"] = "strict"
@@ -74,8 +74,10 @@ class HKAggConfig:
     enable_bin_qc: bool = False                 # Apply QC at the window (bin) level
     enable_day_qc: bool = False                 # Apply QC at the day level
     enable_participant_qc: bool = False          # Apply QC at the participant level
+    
     qc_action: Literal["drop", "mask"] = "drop"  # "drop" removes rows; "mask" sets feature values to NaN
     qc_by_layer: Dict[str, Dict[str, Any]] = field(default_factory=dict)  # Per-layer early-pruning rules
+    
     # Select which feature groups are affected when qc_action="mask".
     qc_mask_selectors: Dict[str, Dict[str, Any]] = field(default_factory=lambda: {
         "bin": {"device_class": ["watch_exclusive", "either"]},
@@ -86,7 +88,7 @@ class HKAggConfig:
     # Pruning
     # -------------------------------------------------------------------------
     # Change early_prune_mode to control which empty windows are removed early.
-    #   "any_data"            — keep window if any type has data
+    #   "any_data"            — keep window if any type has data; when using this method, early pruning has no effect on the final output, but it can reduce memory usage and speed up processing.
     #   "wear_seconds_gt0"    — keep window if watch wear > 0
     #   "any_non_watch_data"  — keep window if any non-watch type has data
     #   "none" / None         — keep all windows
@@ -105,7 +107,7 @@ class HKAggConfig:
     # -------------------------------------------------------------------------
     # Set apply_zero_fill=True to apply each configured statistic's gate and
     # availability rule.
-    apply_zero_fill: bool = False
+    apply_zero_fill: bool = True
     apply_sleep_qc_fill_nan: bool = False        # Fill missing daily sleep stage/category aggregates with zeros when sleep duration is present
 
     # -------------------------------------------------------------------------
@@ -113,8 +115,8 @@ class HKAggConfig:
     # -------------------------------------------------------------------------
     # Set compute_hrv=True to compute additional HRV features from HeartRate.
     compute_hrv: bool = False
-    hrv_time_domain: bool = True        # Compute time-domain HRV metrics (SDNN, RMSSD, etc.)
-    hrv_freq_domain: bool = True        # Compute frequency-domain HRV metrics (LF, HF, etc.)
+    hrv_time_domain: bool = False        # Compute time-domain HRV metrics (SDNN, RMSSD, etc.)
+    hrv_freq_domain: bool = False        # Compute frequency-domain HRV metrics (LF, HF, etc.)
     hrv_min_samples: int = 10           # Min HeartRate samples per window for time-domain HRV
     hrv_freq_min_samples: int = 30      # Min HeartRate samples per window for frequency-domain HRV
     hrv_interpolation_fs: float = 4.0   # Interpolation sampling rate (Hz) for frequency-domain HRV
@@ -220,7 +222,7 @@ def build_default_type_registry(
         "time_behavior": "interval_total",
         "aggregates": ("sum", "duration", "rate_per_min", "continues_from_previous_bin", "continues_into_next_bin"),
         "device_class": "either",
-        "zero_fill_rules": _participant_zero_rules(("sum", "duration", "rate_per_min", "continues_from_previous_bin", "continues_into_next_bin")),
+        "zero_fill_rules": _participant_zero_rules(("duration", "continues_from_previous_bin", "continues_into_next_bin")),
     }
 
     # interval_total — duration-only types (no rate needed)
@@ -252,7 +254,8 @@ def build_default_type_registry(
     reg["EnvironmentalAudioExposure"] = {
         "time_behavior": "interval_level",
         "aggregates": ("leq", "energy_seconds", "time_weighted_mean", "max", "duration",
-                       "median", "median_duration", "count", "continues_from_previous_bin", "continues_into_next_bin"),
+                       "median", "median_duration", "count", "p95", "time_above_85",
+                       "continues_from_previous_bin", "continues_into_next_bin"),
         "device_class": "either",
         "special_aggregates": {
             "p95": {"op": "weighted_quantile", "q": 0.95},
@@ -262,7 +265,8 @@ def build_default_type_registry(
     reg["HeadphoneAudioExposure"] = {
         "time_behavior": "interval_level",
         "aggregates": ("leq", "energy_seconds", "time_weighted_mean", "max", "duration",
-                       "median", "median_duration", "count", "continues_from_previous_bin", "continues_into_next_bin"),
+                       "median", "median_duration", "count", "p95", "time_above_85",
+                       "continues_from_previous_bin", "continues_into_next_bin"),
         "device_class": "non_watch_exclusive",
         "special_aggregates": {
             "p95": {"op": "weighted_quantile", "q": 0.95},
@@ -282,28 +286,39 @@ def build_default_type_registry(
 
     reg["HeartRate"] = {
         "time_behavior": "point",
-        "aggregates": ("mean", "median", "std", "max", "min", "count"),
+        "aggregates": ("mean", "median", "std", "max", "min", "count", "p25", "p75"),
         "device_class": "watch_exclusive",
+        "special_aggregates": {
+            "p25": {"op": "quantile", "q": 0.25},
+            "p75": {"op": "quantile", "q": 0.75},
+        },
     }
     reg["HeartRateVariabilitySDNN"] = {
         "time_behavior": "point",
-        "aggregates": ("mean", "median", "std", "max", "min", "count"),
+        "aggregates": ("mean", "median", "std", "max", "min", "count", "p25", "p75"),
         "device_class": "watch_exclusive",
         "special_aggregates": {
+            "p25": {"op": "quantile", "q": 0.25},
             "p75": {"op": "quantile", "q": 0.75},
         },
     }
     reg["RespiratoryRate"] = {
         "time_behavior": "point",
-        "aggregates": ("mean", "median", "std", "max", "min", "count"),
+        "aggregates": ("mean", "median", "std", "max", "min", "count", "p25", "p75"),
         "device_class": "watch_exclusive",
+        "special_aggregates": {
+            "p25": {"op": "quantile", "q": 0.25},
+            "p75": {"op": "quantile", "q": 0.75},
+        },
     }
     reg["OxygenSaturation"] = {
         "time_behavior": "point",
-        "aggregates": ("mean", "median", "std", "max", "min", "count"),
+        "aggregates": ("mean", "median", "std", "max", "min", "count", "p25", "p75", "pct_below_92"),
         "device_class": "watch_exclusive",
         "special_aggregates": {
-            "pct_below_92": {"op": "pct_below", "threshold": 92.0},
+            "p25": {"op": "quantile", "q": 0.25},
+            "p75": {"op": "quantile", "q": 0.75},
+            "pct_below_92": {"op": "pct_below", "threshold": 0.92},
         },
     }
 
@@ -348,6 +363,10 @@ def build_default_type_registry(
     }
 
     return reg
+
+
+
+
 
 # =============================================================================
 # REUSABLE CONFIGURATION OBJECTS — IMPORT AND INSTANTIATE; DO NOT EDIT HERE
@@ -655,6 +674,10 @@ def build_default_op_registry() -> Dict[str, OpFn]:
         register_feature_operation(registry, k, v)
 
     return registry
+
+
+
+
 
 # =============================================================================
 # INTERNAL VALIDATION AND HELPERS — DO NOT EDIT
