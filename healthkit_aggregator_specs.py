@@ -1,169 +1,145 @@
 """
-Configuration for HealthKit aggregation (Stage 3 of the pipeline).
+User configuration for HealthKit aggregation (Stage 3 of the pipeline).
 
-Modify this file to:
-  - Add or customize HealthKit types and their output features (type registry)
-  - Control windowing, wear detection, quality control, and pruning (HKAggConfig)
-  - Define hierarchical rollup layers (LayerSpec / LayerRule)
+HOW TO CUSTOMIZE THIS STAGE
+- Edit HKAggConfig to control windows, wear detection, quality control,
+  zero filling, pruning, HRV features, and parallelism.
+- Edit build_default_type_registry() to select HealthKit types and the
+  output features constructed for each type.
+- Import and instantiate SleepFeatureSpec, AssessmentWindowSpec, LayerRule,
+  and LayerSpec when supplying specialized configurations in pipeline code;
+  do not edit their class definitions for a particular analysis.
+- Edit the custom-operation section only when adding a new hierarchical
+  aggregation operator.
+- Do not edit the internal validation and helper functions unless you are
+  changing how aggregation works.
 
-Key sections:
-  - build_default_type_registry(): defines which HealthKit types produce which features
-  - HKAggConfig: main configuration dataclass for the aggregator
-  - LayerRule / LayerSpec: declarative hierarchical aggregation (e.g., hourly -> daily)
-  - build_default_op_registry(): operators available for hierarchical layers
-
-Notes:
-  - The current aggregation code lacks a counterpart or replication of
-     Samir's time domain and circadian features. You may add such code to
-     the scripts, or you may generate them using Samir's code and then merge
-     them onto the features generated here.
-  - While plausibility thresholds are applied during cleaning, 
-     you may inspect the data again after aggregation and remove
-     unrealistic values if any emerge, particularly for types not 
-     assigned thresholds during cleaning. This functionality isn't
-     built in currently, but you can do so by writing your own code
-     to modify the resulting aggregated dataset.
+NOTES
+- The current aggregation code does not reproduce Samir's time-domain and
+  circadian features. Generate those separately and merge them with these
+  features, or extend the pipeline implementation.
+- Plausibility thresholds are applied during cleaning. Aggregated outputs may
+  still require study-specific review, especially for types without thresholds.
 """
+
 from __future__ import annotations
+
 from dataclasses import dataclass, field
-from typing import Dict, List, Literal, Optional, Any, Callable
+from typing import Any, Callable, Dict, List, Literal, Optional
+
 import numpy as np
 import pandas as pd
 
-# ============================================================================
-# Default HK Type Registry Builder
-# ============================================================================
-SLEEP_LABEL_SUFFIXES = (
-    "in_bed",
-    "asleep",
-    "asleep_unspecified",
-    "asleep_core",
-    "asleep_deep",
-    "asleep_rem",
-    "awake",
-    "awake_unspecified",
-    "sleep_unknown",
-)
-SLEEP_UNION_SUFFIXES = ("in_bed", "asleep", "awake")
-SLEEP_WINDOW_STATISTICS = (
-    "sum",
-    "mean",
-    "count",
-    "continues_from_previous_bin",
-    "continues_into_next_bin",
-)
+# =============================================================================
+# USER-EDITABLE DEFAULTS — EDIT VALUES IN THIS SECTION
+# =============================================================================
+# Edit HKAggConfig to change pipeline defaults. Edit the entries in
+# build_default_type_registry() to change default types and output features.
 
+@dataclass
+class HKAggConfig:
+    """Settings that users can change for the HealthKit aggregation stage."""
 
-@dataclass(frozen=True)
-class SleepFeatureSpec:
-    """Select granular sleep labels, unions, and window statistics."""
+    # -------------------------------------------------------------------------
+    # Time and binning
+    # -------------------------------------------------------------------------
+    # Change these values to control the width, alignment, and displayed
+    # timezone of the output windows.
+    bin_size: str = "1H"               # Window width as pandas frequency string (e.g."1H", "30min", "1D")
+    bin_origin: str = "00:00:00"       # Time-of-day that windows align to (e.g., "00:00:00" = midnight)
+    tz_mode_l0: Literal["utc", "local"] = "utc"  # "utc" bins by UTC timestamps; "local" bins by local time
+    output_timezone: Literal["UTC", "local", "both"] = "both"  # Which timestamps appear in output columns
 
-    labels: tuple[str, ...] = SLEEP_LABEL_SUFFIXES
-    unions: tuple[str, ...] = SLEEP_UNION_SUFFIXES
-    statistics: tuple[str, ...] = SLEEP_WINDOW_STATISTICS
+    # -------------------------------------------------------------------------
+    # Timezone schedule inference
+    # -------------------------------------------------------------------------
+    tz_policy: Literal["strict", "lenient"] = "strict"
+    utc_schedule_inference_policy: Literal["skip", "infer_fallback", "infer_fail"] = "infer_fallback"
+    schedule_point_policy: Literal["include_epsilon", "exclude"] = "include_epsilon"
+    schedule_point_epsilon: str = "1ns"
+    schedule_invalid_tz_policy: Literal["strict", "coerce_default"] = "strict"
 
-    def validate(self) -> None:
-        selections = (
-            ("labels", self.labels, SLEEP_LABEL_SUFFIXES),
-            ("unions", self.unions, SLEEP_UNION_SUFFIXES),
-            ("statistics", self.statistics, SLEEP_WINDOW_STATISTICS),
-        )
-        for name, values, allowed in selections:
-            unknown = sorted(set(values) - set(allowed))
-            if unknown:
-                raise ValueError(f"SleepFeatureSpec.{name} contains unsupported value(s): {unknown}")
-            if len(values) != len(set(values)):
-                raise ValueError(f"SleepFeatureSpec.{name} must not contain duplicates")
+    # -------------------------------------------------------------------------
+    # Wear detection
+    # -------------------------------------------------------------------------
+    hr_type: str = "HeartRate"                  # HealthKit type used to detect watch wear
+    hr_coverage_window_seconds: int = 300       # Sliding window size (seconds) for heart rate coverage
+    bin_frac_min: Optional[float] = 0.80        # Min fraction of window with HR data to count as "watch on" (0.0-1.0; None to disable)
+    day_frac_min: Optional[float] = None        # Min fraction of day with watch wear (None to disable)
+    overall_frac_min: Optional[float] = None    # Min overall participant wear fraction (None to disable)
 
-    def aggregate_names(self) -> tuple[str, ...]:
-        self.validate()
-        label_features = tuple(
-            f"{stat}_label_{label}"
-            for label in self.labels
-            for stat in self.statistics
-        )
-        union_features = tuple(
-            f"{stat}_any_{union}"
-            for union in self.unions
-            for stat in self.statistics
-        )
-        return label_features + union_features
+    # -------------------------------------------------------------------------
+    # Quality control
+    # -------------------------------------------------------------------------.
+    enable_bin_qc: bool = False                 # Apply QC at the window (bin) level
+    enable_day_qc: bool = False                 # Apply QC at the day level
+    enable_participant_qc: bool = False          # Apply QC at the participant level
+    qc_action: Literal["drop", "mask"] = "drop"  # "drop" removes rows; "mask" sets feature values to NaN
+    qc_by_layer: Dict[str, Dict[str, Any]] = field(default_factory=dict)  # Per-layer early-pruning rules
+    # Select which feature groups are affected when qc_action="mask".
+    qc_mask_selectors: Dict[str, Dict[str, Any]] = field(default_factory=lambda: {
+        "bin": {"device_class": ["watch_exclusive", "either"]},
+        "day": {"all": True},
+        "participant": {"all": True},})
 
+    # -------------------------------------------------------------------------
+    # Pruning
+    # -------------------------------------------------------------------------
+    # Change early_prune_mode to control which empty windows are removed early.
+    #   "any_data"            — keep window if any type has data
+    #   "wear_seconds_gt0"    — keep window if watch wear > 0
+    #   "any_non_watch_data"  — keep window if any non-watch type has data
+    #   "none" / None         — keep all windows
+    early_prune_mode: Optional[Literal["none", "wear_seconds_gt0", "any_data", "any_non_watch_data"]] = "any_data"
+    early_pruning_types: Optional[List[str]] = None  # Restrict pruning check to specific types (None = all)
+    prune_empty_rows: bool = True
 
-@dataclass(frozen=True)
-class AssessmentWindowSpec:
-    """Define how lookback windows are constructed for each assessment.
+    # -------------------------------------------------------------------------
+    # Type registry
+    # -------------------------------------------------------------------------
+    # To edit, see build_default_type_registry() below.
+    type_registry: Dict[str, Dict[str, Any]] = field(default_factory=lambda: build_default_type_registry())
 
-    ``aligned_grid`` requires ``bin_size`` and exactly one lookback definition:
-    ``n_bins`` selects a fixed number of canonical bins, whereas
-    ``duration_before`` clips the first and final bins to cover an exact elapsed
-    duration before the assessment.
-    """
+    # -------------------------------------------------------------------------
+    # Zero fill
+    # -------------------------------------------------------------------------
+    # Set apply_zero_fill=True to apply each configured statistic's gate and
+    # availability rule.
+    apply_zero_fill: bool = False
+    apply_sleep_qc_fill_nan: bool = False        # Fill missing daily sleep stage/category aggregates with zeros when sleep duration is present
 
-    mode: Literal["whole_lookback", "split_lookback", "aligned_grid"]
-    duration_before: Optional[Any] = None
-    n_bins: Optional[int] = None
-    bin_size: Optional[Any] = None
-    bin_origin: Optional[Any] = None
-    tz_mode: Optional[Literal["utc", "local"]] = None
+    # -------------------------------------------------------------------------
+    # Heart rate variability
+    # -------------------------------------------------------------------------
+    # Set compute_hrv=True to compute additional HRV features from HeartRate.
+    compute_hrv: bool = False
+    hrv_time_domain: bool = True        # Compute time-domain HRV metrics (SDNN, RMSSD, etc.)
+    hrv_freq_domain: bool = True        # Compute frequency-domain HRV metrics (LF, HF, etc.)
+    hrv_min_samples: int = 10           # Min HeartRate samples per window for time-domain HRV
+    hrv_freq_min_samples: int = 30      # Min HeartRate samples per window for frequency-domain HRV
+    hrv_interpolation_fs: float = 4.0   # Interpolation sampling rate (Hz) for frequency-domain HRV
 
-    def validate(self) -> None:
-        if self.mode not in {"whole_lookback", "split_lookback", "aligned_grid"}:
-            raise ValueError(
-                "AssessmentWindowSpec.mode must be 'whole_lookback', "
-                "'split_lookback', or 'aligned_grid'"
-            )
+    # -------------------------------------------------------------------------
+    # Parallelism
+    # -------------------------------------------------------------------------
+    # Thread pool size for interval assignment parallelization.
+    # None = auto-detect CPU count via os.cpu_count() or 1.
+    max_workers: int | None = None
 
-        populated = {
-            name
-            for name in ("duration_before", "n_bins", "bin_size", "bin_origin", "tz_mode")
-            if getattr(self, name) is not None
-        }
-        required = {
-            "whole_lookback": {"duration_before"},
-            "split_lookback": {"duration_before", "n_bins"},
-            "aligned_grid": {"bin_size"},
-        }[self.mode]
-        allowed = {
-            "whole_lookback": {"duration_before"},
-            "split_lookback": {"duration_before", "n_bins"},
-            "aligned_grid": {
-                "duration_before", "n_bins", "bin_size", "bin_origin", "tz_mode"
-            },
-        }[self.mode]
-        missing = required - populated
-        irrelevant = populated - allowed
-        if missing or irrelevant:
-            raise ValueError(
-                f"AssessmentWindowSpec(mode={self.mode!r}) has "
-                f"missing={sorted(missing)} irrelevant={sorted(irrelevant)}"
-            )
+    def validate(self):
+        """Validate the configured values."""
+        _validate_agg_config(self)
 
-        if self.mode == "aligned_grid" and (
-            (self.duration_before is None) == (self.n_bins is None)
-        ):
-            raise ValueError(
-                "aligned_grid requires exactly one of duration_before or n_bins"
-            )
-
-        if self.duration_before is not None:
-            duration = pd.to_timedelta(self.duration_before)
-            if pd.isna(duration) or duration <= pd.Timedelta(0):
-                raise ValueError("duration_before must be a positive duration")
-        if self.n_bins is not None:
-            if isinstance(self.n_bins, bool) or int(self.n_bins) != self.n_bins or int(self.n_bins) < 1:
-                raise ValueError("n_bins must be a positive integer")
-        if self.bin_size is not None:
-            bin_size = pd.to_timedelta(self.bin_size)
-            seconds = bin_size.total_seconds()
-            if pd.isna(bin_size) or seconds < 1 or not float(seconds).is_integer():
-                raise ValueError("bin_size must be a fixed duration in whole seconds")
-        if self.bin_origin is not None:
-            origin = pd.to_timedelta(self.bin_origin)
-            if pd.isna(origin) or origin < pd.Timedelta(0) or origin >= pd.Timedelta(days=1):
-                raise ValueError("bin_origin must be within [00:00:00, 24:00:00)")
-        if self.tz_mode is not None and self.tz_mode not in {"utc", "local"}:
-            raise ValueError("tz_mode must be 'utc' or 'local'")
+# -----------------------------------------------------------------------------
+# HealthKit types and output features
+# -----------------------------------------------------------------------------
+# Edit the entries in build_default_type_registry() to change which HealthKit
+# types are aggregated and which output statistics are constructed.
+#
+# To add a type:
+# 1. Copy an entry with the same time_behavior.
+# 2. Replace the HealthKit type name.
+# 3. Select the desired aggregates and device_class.
 
 
 def build_default_type_registry(
@@ -196,16 +172,6 @@ def build_default_type_registry(
     reg: Dict[str, Dict[str, Any]] = {}
     sleep_features = sleep_features or SleepFeatureSpec()
     sleep_aggregates = sleep_features.aggregate_names()
-
-    def _participant_zero_rules(statistics: tuple[str, ...]) -> Dict[str, Dict[str, Any]]:
-        return {
-            statistic: {
-                "gate": ("watch_on", {}),
-                "fill_value": 0.0,
-                "availability": "participant_evidence",
-            }
-            for statistic in statistics
-        }
 
     # -----------------------------------------------------------------------
     # INTERVAL TOTAL — Cumulative measures recorded over time intervals
@@ -383,170 +349,91 @@ def build_default_type_registry(
 
     return reg
 
-# ============================================================================
-# Configuration Dataclass
-# ============================================================================
-@dataclass
-class HKAggConfig:
-    """Main configuration for the HealthKit aggregation stage."""
+# =============================================================================
+# REUSABLE CONFIGURATION OBJECTS — IMPORT AND INSTANTIATE; DO NOT EDIT HERE
+# =============================================================================
+# These public classes describe optional configurations supplied elsewhere in
+# pipeline code. Import and instantiate them rather than editing their class
+# definitions for a particular analysis.
 
-    # --- Time / Binning ---
-    bin_size: str = "1H"               # Window width as pandas frequency string (e.g., "1H", "30min", "1D")
-    bin_origin: str = "00:00:00"       # Time-of-day that windows align to (e.g., "00:00:00" = midnight)
-    tz_mode_l0: Literal["utc", "local"] = "utc"  # "utc" bins by UTC timestamps; "local" bins by local time
-    output_timezone: Literal["UTC", "local", "both"] = "both"  # Which timestamps appear in output columns
+# -----------------------------------------------------------------------------
+# Supported sleep-feature values
+# -----------------------------------------------------------------------------
+# These tuples define the supported labels, unions, and statistics and also
+# serve as the defaults for SleepFeatureSpec().
+#
+# For a particular analysis, do not edit these tuples. Instead, construct
+# SleepFeatureSpec(labels=..., unions=..., statistics=...) and pass it to
+# build_default_type_registry(). Edit these tuples only when extending the
+# pipeline's supported sleep schema.
+SLEEP_LABEL_SUFFIXES = (
+    "in_bed",
+    "asleep",
+    "asleep_unspecified",
+    "asleep_core",
+    "asleep_deep",
+    "asleep_rem",
+    "awake",
+    "awake_unspecified",
+    "sleep_unknown",
+)
+SLEEP_UNION_SUFFIXES = ("in_bed", "asleep", "awake")
+SLEEP_WINDOW_STATISTICS = (
+    "sum",
+    "mean",
+    "count",
+    "continues_from_previous_bin",
+    "continues_into_next_bin",
+)
 
-    # --- Schedule (advanced) ---
-    # These control timezone schedule inference. Defaults work for most research workflows.
-    tz_policy: Literal["strict", "lenient"] = "strict"
-    utc_schedule_inference_policy: Literal["skip", "infer_fallback", "infer_fail"] = "infer_fallback"
-    schedule_point_policy: Literal["include_epsilon", "exclude"] = "include_epsilon"
-    schedule_point_epsilon: str = "1ns"
-    schedule_invalid_tz_policy: Literal["strict", "coerce_default"] = "strict"
 
-    # --- Wear Detection ---
-    hr_type: str = "HeartRate"                  # HealthKit type used to detect watch wear
-    hr_coverage_window_seconds: int = 300       # Sliding window size (seconds) for heart rate coverage
-    bin_frac_min: Optional[float] = 0.80        # Min fraction of window with HR data to count as "watch on" (0.0-1.0; None to disable)
-    day_frac_min: Optional[float] = None        # Min fraction of day with watch wear (None to disable)
-    overall_frac_min: Optional[float] = None    # Min overall participant wear fraction (None to disable)
+@dataclass(frozen=True)
+class SleepFeatureSpec:
+    """Select granular sleep labels, unions, and window statistics."""
 
-    # --- Quality Control ---
-    enable_bin_qc: bool = False                 # Apply QC at the window (bin) level
-    enable_day_qc: bool = False                 # Apply QC at the day level
-    enable_participant_qc: bool = False          # Apply QC at the participant level
-    qc_action: Literal["drop", "mask"] = "drop"  # "drop" removes rows; "mask" sets feature values to NaN
-    qc_by_layer: Dict[str, Dict[str, Any]] = field(default_factory=dict)
-    qc_mask_selectors: Dict[str, Dict[str, Any]] = field(default_factory=lambda: {
-        "bin": {"device_class": ["watch_exclusive", "either"]},
-        "day": {"all": True},
-        "participant": {"all": True},})
+    labels: tuple[str, ...] = SLEEP_LABEL_SUFFIXES
+    unions: tuple[str, ...] = SLEEP_UNION_SUFFIXES
+    statistics: tuple[str, ...] = SLEEP_WINDOW_STATISTICS
 
-    # --- Pruning ---
-    # Drop empty windows early to save memory.
-    #   "any_data"            — keep window if any type has data
-    #   "wear_seconds_gt0"    — keep window if watch wear > 0
-    #   "any_non_watch_data"  — keep window if any non-watch type has data
-    #   "none" / None         — keep all windows
-    early_prune_mode: Optional[Literal["none", "wear_seconds_gt0", "any_data", "any_non_watch_data"]] = "any_data"
-    early_pruning_types: Optional[List[str]] = None  # Restrict pruning check to specific types (None = all)
-    prune_empty_rows: bool = True
+    def validate(self) -> None:
+        """Validate the selected sleep features."""
+        _validate_sleep_feature_spec(self)
 
-    # --- Type Registry ---
-    # Maps HealthKit type names to their aggregation behavior. See build_default_type_registry() above.
-    type_registry: Dict[str, Dict[str, Any]] = field(default_factory=build_default_type_registry)
+    def aggregate_names(self) -> tuple[str, ...]:
+        """Return the selected sleep feature names."""
+        return _build_sleep_aggregate_names(self)
 
-    # --- Zero Fill ---
-    # If True, apply each configured statistic's gate and availability rule.
-    apply_zero_fill: bool = False
-    apply_sleep_qc_fill_nan: bool = False        # Fill missing daily sleep stage/category aggregates with zeros when sleep duration is present
+# -----------------------------------------------------------------------------
+# Assessment-window specification
+# -----------------------------------------------------------------------------
 
-    # --- HRV ---
-    # If True, compute additional heart rate variability features from HeartRate data.
-    compute_hrv: bool = False
-    hrv_time_domain: bool = True        # Compute time-domain HRV metrics (SDNN, RMSSD, etc.)
-    hrv_freq_domain: bool = True        # Compute frequency-domain HRV metrics (LF, HF, etc.)
-    hrv_min_samples: int = 10           # Min HeartRate samples per window for time-domain HRV
-    hrv_freq_min_samples: int = 30      # Min HeartRate samples per window for frequency-domain HRV
-    hrv_interpolation_fs: float = 4.0   # Interpolation sampling rate (Hz) for frequency-domain HRV
 
-    # --- Parallelism ---
-    # Thread pool size for interval assignment parallelization.
-    # None = auto-detect CPU count via os.cpu_count() or 1.
-    max_workers: int | None = None
+@dataclass(frozen=True)
+class AssessmentWindowSpec:
+    """Define how lookback windows are constructed for each assessment.
 
-    # =========================
-    # Self-validate config values
-    # =========================
-    def validate(self):
-        """Light config validation; raise early for schema errors."""
-        if hasattr(self, "tz_mode_10"):
-            raise ValueError("Use `tz_mode_l0` (letter l + zero), not `tz_mode_10`.")
-        bin_duration = pd.to_timedelta(self.bin_size)
-        bin_seconds = bin_duration.total_seconds()
-        if pd.isna(bin_duration) or bin_seconds < 1 or not float(bin_seconds).is_integer():
-            raise ValueError("bin_size must be a fixed duration in whole seconds")
-        origin = pd.to_timedelta(self.bin_origin)
-        if pd.isna(origin) or origin < pd.Timedelta(0) or origin >= pd.Timedelta(days=1):
-            raise ValueError("bin_origin must be within [00:00:00, 24:00:00)")
-        for t, meta in self.type_registry.items():
-            if "time_behavior" not in meta: raise ValueError(f"type_registry entry '{t}' missing 'time_behavior'")
-            rules = meta.get("zero_fill_rules", {})
-            if not isinstance(rules, dict):
-                raise ValueError(f"type_registry entry '{t}' zero_fill_rules must be a mapping")
-            configured = set(meta.get("aggregates", ()))
-            for statistic, rule in rules.items():
-                if statistic not in configured:
-                    raise ValueError(
-                        f"type_registry entry '{t}' has a zero-fill rule for unconfigured statistic '{statistic}'"
-                    )
-                if not isinstance(rule, dict):
-                    raise ValueError(f"zero-fill rule '{t}__{statistic}' must be a mapping")
-                unknown = set(rule) - {"gate", "fill_value", "availability"}
-                missing = {"gate", "fill_value", "availability"} - set(rule)
-                if unknown or missing:
-                    raise ValueError(
-                        f"zero-fill rule '{t}__{statistic}' has unknown={sorted(unknown)} missing={sorted(missing)}"
-                    )
-                gate = rule["gate"]
-                if not (
-                    isinstance(gate, tuple)
-                    and len(gate) == 2
-                    and isinstance(gate[0], str)
-                    and isinstance(gate[1], dict)
-                ):
-                    raise ValueError(
-                        f"zero-fill rule '{t}__{statistic}' gate must be a (name, parameters) tuple"
-                    )
-                supported_gates = {
-                    "expr_false", "watch_on", "source_present",
-                    "any_source_present", "any_non_watch_present", "presence_types",
-                }
-                if gate[0] not in supported_gates:
-                    raise ValueError(
-                        f"zero-fill rule '{t}__{statistic}' has unsupported gate '{gate[0]}'"
-                    )
-                try:
-                    fill_value = float(rule["fill_value"])
-                except (TypeError, ValueError) as exc:
-                    raise ValueError(
-                        f"zero-fill rule '{t}__{statistic}' fill_value must be numeric"
-                    ) from exc
-                if not np.isfinite(fill_value):
-                    raise ValueError(
-                        f"zero-fill rule '{t}__{statistic}' fill_value must be finite"
-                    )
-                if rule["availability"] not in {"participant_evidence", "assume_available"}:
-                    raise ValueError(
-                        f"zero-fill rule '{t}__{statistic}' availability must be "
-                        "'participant_evidence' or 'assume_available'"
-                    )
-        if self.qc_action not in {"drop","mask"}: raise ValueError("qc_action must be 'drop' or 'mask'")
-        if self.tz_mode_l0 not in {"utc","local"}: raise ValueError("tz_mode_l0 must be one of {'utc','local'}")
-        if self.tz_policy not in {"strict","lenient"}: raise ValueError("tz_policy must be one of {'strict','lenient'}")
-        if self.output_timezone not in {"UTC","local","both"}: raise ValueError("output_timezone must be one of {'UTC','local','both'}")
-        if self.utc_schedule_inference_policy not in {"skip","infer_fallback","infer_fail"}:
-            raise ValueError("utc_schedule_inference_policy must be one of {'skip','infer_fallback','infer_fail'}")
-        if self.schedule_point_policy not in {"include_epsilon","exclude"}:
-            raise ValueError("schedule_point_policy must be one of {'include_epsilon','exclude'}")
-        if self.schedule_invalid_tz_policy not in {"strict","coerce_default"}:
-            raise ValueError("schedule_invalid_tz_policy must be one of {'strict','coerce_default'}")
-        eps = pd.to_timedelta(self.schedule_point_epsilon)
-        if eps <= pd.Timedelta(0):
-            raise ValueError("schedule_point_epsilon must be > 0")
-        if self.hrv_min_samples < 2: raise ValueError("hrv_min_samples must be >= 2")
-        if self.hrv_freq_min_samples < 4: raise ValueError("hrv_freq_min_samples must be >= 4")
-        if self.hrv_interpolation_fs <= 0: raise ValueError("hrv_interpolation_fs must be > 0")
-        _valid_prune = {"none", "wear_seconds_gt0", "any_data", "any_non_watch_data", None}
-        if self.early_prune_mode not in _valid_prune:
-            raise ValueError(f"early_prune_mode must be one of {_valid_prune!r}, got {self.early_prune_mode!r}")
-        for _name, _val in [("bin_frac_min", self.bin_frac_min), ("day_frac_min", self.day_frac_min), ("overall_frac_min", self.overall_frac_min)]:
-            if _val is not None and not (0.0 <= _val <= 1.0):
-                raise ValueError(f"{_name} must be in [0, 1], got {_val}")
+    ``aligned_grid`` requires ``bin_size`` and exactly one lookback definition:
+    ``n_bins`` selects a fixed number of canonical bins, whereas
+    ``duration_before`` clips the first and final bins to cover an exact elapsed
+    duration before the assessment.
+    """
 
-# ============================================================================
-# Hierarchical Aggregation Specifications
-# ============================================================================
+    mode: Literal["whole_lookback", "split_lookback", "aligned_grid"]
+    duration_before: Optional[Any] = None
+    n_bins: Optional[int] = None
+    bin_size: Optional[Any] = None
+    bin_origin: Optional[Any] = None
+    tz_mode: Optional[Literal["utc", "local"]] = None
+
+    def validate(self) -> None:
+        """Validate the configured assessment window."""
+        _validate_assessment_window_spec(self)
+
+# -----------------------------------------------------------------------------
+# Hierarchical-rollup specifications
+# -----------------------------------------------------------------------------
+
+
 @dataclass
 class LayerRule:
     """
@@ -560,6 +447,7 @@ class LayerRule:
     op: str                         # Operator name from the op registry (e.g., "mean", "sum", "weighted_mean")
     inputs: Dict[str, Any]          # Parameters passed to the operator (e.g., {"col": "HeartRate__median"})
     strict: Optional[bool] = None   # True = error if input column missing; False = skip silently; None = use layer default
+
 
 @dataclass
 class LayerSpec:
@@ -579,14 +467,20 @@ class LayerSpec:
     strict: bool = True                             # Default strict mode for rules that don't specify their own
     tz_mode: str = "utc"                            # Timezone mode for window boundaries
 
-# ============================================================================
-# Operations Registry
-# ============================================================================
+# =============================================================================
+# ADVANCED EXTENSION POINT — CUSTOM AGGREGATION OPERATIONS
+# =============================================================================
+# Most users do not need to edit this section. Edit build_default_op_registry()
+# to add an operation that LayerRule.op should reference by default, or call
+# register_feature_operation(aggregator.op_registry, ...) after construction.
+
 OpFn = Callable[[pd.core.groupby.generic.DataFrameGroupBy, Dict[str, Any]], pd.Series]
+
 
 def register_feature_operation(registry: Dict[str, OpFn], key: str, fn: OpFn) -> None:
     """Register a new operator callable(groupby, inputs) -> Series."""
     registry[key] = fn
+
 
 def build_default_op_registry() -> Dict[str, OpFn]:
     """
@@ -761,3 +655,194 @@ def build_default_op_registry() -> Dict[str, OpFn]:
         register_feature_operation(registry, k, v)
 
     return registry
+
+# =============================================================================
+# INTERNAL VALIDATION AND HELPERS — DO NOT EDIT
+# =============================================================================
+# The helpers below validate and support the public settings above.
+# Change them only when modifying pipeline behavior itself.
+
+def _validate_agg_config(self: HKAggConfig) -> None:
+    """Light config validation; raise early for schema errors."""
+    if hasattr(self, "tz_mode_10"):
+        raise ValueError("Use `tz_mode_l0` (letter l + zero), not `tz_mode_10`.")
+    bin_duration = pd.to_timedelta(self.bin_size)
+    bin_seconds = bin_duration.total_seconds()
+    if pd.isna(bin_duration) or bin_seconds < 1 or not float(bin_seconds).is_integer():
+        raise ValueError("bin_size must be a fixed duration in whole seconds")
+    origin = pd.to_timedelta(self.bin_origin)
+    if pd.isna(origin) or origin < pd.Timedelta(0) or origin >= pd.Timedelta(days=1):
+        raise ValueError("bin_origin must be within [00:00:00, 24:00:00)")
+    for t, meta in self.type_registry.items():
+        if "time_behavior" not in meta: raise ValueError(f"type_registry entry '{t}' missing 'time_behavior'")
+        rules = meta.get("zero_fill_rules", {})
+        if not isinstance(rules, dict):
+            raise ValueError(f"type_registry entry '{t}' zero_fill_rules must be a mapping")
+        configured = set(meta.get("aggregates", ()))
+        for statistic, rule in rules.items():
+            if statistic not in configured:
+                raise ValueError(
+                    f"type_registry entry '{t}' has a zero-fill rule for unconfigured statistic '{statistic}'"
+                )
+            if not isinstance(rule, dict):
+                raise ValueError(f"zero-fill rule '{t}__{statistic}' must be a mapping")
+            unknown = set(rule) - {"gate", "fill_value", "availability"}
+            missing = {"gate", "fill_value", "availability"} - set(rule)
+            if unknown or missing:
+                raise ValueError(
+                    f"zero-fill rule '{t}__{statistic}' has unknown={sorted(unknown)} missing={sorted(missing)}"
+                )
+            gate = rule["gate"]
+            if not (
+                isinstance(gate, tuple)
+                and len(gate) == 2
+                and isinstance(gate[0], str)
+                and isinstance(gate[1], dict)
+            ):
+                raise ValueError(
+                    f"zero-fill rule '{t}__{statistic}' gate must be a (name, parameters) tuple"
+                )
+            supported_gates = {
+                "expr_false", "watch_on", "source_present",
+                "any_source_present", "any_non_watch_present", "presence_types",
+            }
+            if gate[0] not in supported_gates:
+                raise ValueError(
+                    f"zero-fill rule '{t}__{statistic}' has unsupported gate '{gate[0]}'"
+                )
+            try:
+                fill_value = float(rule["fill_value"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"zero-fill rule '{t}__{statistic}' fill_value must be numeric"
+                ) from exc
+            if not np.isfinite(fill_value):
+                raise ValueError(
+                    f"zero-fill rule '{t}__{statistic}' fill_value must be finite"
+                )
+            if rule["availability"] not in {"participant_evidence", "assume_available"}:
+                raise ValueError(
+                    f"zero-fill rule '{t}__{statistic}' availability must be "
+                    "'participant_evidence' or 'assume_available'"
+                )
+    if self.qc_action not in {"drop","mask"}: raise ValueError("qc_action must be 'drop' or 'mask'")
+    if self.tz_mode_l0 not in {"utc","local"}: raise ValueError("tz_mode_l0 must be one of {'utc','local'}")
+    if self.tz_policy not in {"strict","lenient"}: raise ValueError("tz_policy must be one of {'strict','lenient'}")
+    if self.output_timezone not in {"UTC","local","both"}: raise ValueError("output_timezone must be one of {'UTC','local','both'}")
+    if self.utc_schedule_inference_policy not in {"skip","infer_fallback","infer_fail"}:
+        raise ValueError("utc_schedule_inference_policy must be one of {'skip','infer_fallback','infer_fail'}")
+    if self.schedule_point_policy not in {"include_epsilon","exclude"}:
+        raise ValueError("schedule_point_policy must be one of {'include_epsilon','exclude'}")
+    if self.schedule_invalid_tz_policy not in {"strict","coerce_default"}:
+        raise ValueError("schedule_invalid_tz_policy must be one of {'strict','coerce_default'}")
+    eps = pd.to_timedelta(self.schedule_point_epsilon)
+    if eps <= pd.Timedelta(0):
+        raise ValueError("schedule_point_epsilon must be > 0")
+    if self.hrv_min_samples < 2: raise ValueError("hrv_min_samples must be >= 2")
+    if self.hrv_freq_min_samples < 4: raise ValueError("hrv_freq_min_samples must be >= 4")
+    if self.hrv_interpolation_fs <= 0: raise ValueError("hrv_interpolation_fs must be > 0")
+    _valid_prune = {"none", "wear_seconds_gt0", "any_data", "any_non_watch_data", None}
+    if self.early_prune_mode not in _valid_prune:
+        raise ValueError(f"early_prune_mode must be one of {_valid_prune!r}, got {self.early_prune_mode!r}")
+    for _name, _val in [("bin_frac_min", self.bin_frac_min), ("day_frac_min", self.day_frac_min), ("overall_frac_min", self.overall_frac_min)]:
+        if _val is not None and not (0.0 <= _val <= 1.0):
+            raise ValueError(f"{_name} must be in [0, 1], got {_val}")
+
+
+def _validate_sleep_feature_spec(self: SleepFeatureSpec) -> None:
+    selections = (
+        ("labels", self.labels, SLEEP_LABEL_SUFFIXES),
+        ("unions", self.unions, SLEEP_UNION_SUFFIXES),
+        ("statistics", self.statistics, SLEEP_WINDOW_STATISTICS),
+    )
+    for name, values, allowed in selections:
+        unknown = sorted(set(values) - set(allowed))
+        if unknown:
+            raise ValueError(f"SleepFeatureSpec.{name} contains unsupported value(s): {unknown}")
+        if len(values) != len(set(values)):
+            raise ValueError(f"SleepFeatureSpec.{name} must not contain duplicates")
+
+
+def _build_sleep_aggregate_names(self: SleepFeatureSpec) -> tuple[str, ...]:
+    self.validate()
+    label_features = tuple(
+        f"{stat}_label_{label}"
+        for label in self.labels
+        for stat in self.statistics
+    )
+    union_features = tuple(
+        f"{stat}_any_{union}"
+        for union in self.unions
+        for stat in self.statistics
+    )
+    return label_features + union_features
+
+
+def _validate_assessment_window_spec(self: AssessmentWindowSpec) -> None:
+    if self.mode not in {"whole_lookback", "split_lookback", "aligned_grid"}:
+        raise ValueError(
+            "AssessmentWindowSpec.mode must be 'whole_lookback', "
+            "'split_lookback', or 'aligned_grid'"
+        )
+
+    populated = {
+        name
+        for name in ("duration_before", "n_bins", "bin_size", "bin_origin", "tz_mode")
+        if getattr(self, name) is not None
+    }
+    required = {
+        "whole_lookback": {"duration_before"},
+        "split_lookback": {"duration_before", "n_bins"},
+        "aligned_grid": {"bin_size"},
+    }[self.mode]
+    allowed = {
+        "whole_lookback": {"duration_before"},
+        "split_lookback": {"duration_before", "n_bins"},
+        "aligned_grid": {
+            "duration_before", "n_bins", "bin_size", "bin_origin", "tz_mode"
+        },
+    }[self.mode]
+    missing = required - populated
+    irrelevant = populated - allowed
+    if missing or irrelevant:
+        raise ValueError(
+            f"AssessmentWindowSpec(mode={self.mode!r}) has "
+            f"missing={sorted(missing)} irrelevant={sorted(irrelevant)}"
+        )
+
+    if self.mode == "aligned_grid" and (
+        (self.duration_before is None) == (self.n_bins is None)
+    ):
+        raise ValueError(
+            "aligned_grid requires exactly one of duration_before or n_bins"
+        )
+
+    if self.duration_before is not None:
+        duration = pd.to_timedelta(self.duration_before)
+        if pd.isna(duration) or duration <= pd.Timedelta(0):
+            raise ValueError("duration_before must be a positive duration")
+    if self.n_bins is not None:
+        if isinstance(self.n_bins, bool) or int(self.n_bins) != self.n_bins or int(self.n_bins) < 1:
+            raise ValueError("n_bins must be a positive integer")
+    if self.bin_size is not None:
+        bin_size = pd.to_timedelta(self.bin_size)
+        seconds = bin_size.total_seconds()
+        if pd.isna(bin_size) or seconds < 1 or not float(seconds).is_integer():
+            raise ValueError("bin_size must be a fixed duration in whole seconds")
+    if self.bin_origin is not None:
+        origin = pd.to_timedelta(self.bin_origin)
+        if pd.isna(origin) or origin < pd.Timedelta(0) or origin >= pd.Timedelta(days=1):
+            raise ValueError("bin_origin must be within [00:00:00, 24:00:00)")
+    if self.tz_mode is not None and self.tz_mode not in {"utc", "local"}:
+        raise ValueError("tz_mode must be 'utc' or 'local'")
+
+
+def _participant_zero_rules(statistics: tuple[str, ...]) -> Dict[str, Dict[str, Any]]:
+    return {
+        statistic: {
+            "gate": ("watch_on", {}),
+            "fill_value": 0.0,
+            "availability": "participant_evidence",
+        }
+        for statistic in statistics
+    }
