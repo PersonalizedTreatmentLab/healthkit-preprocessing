@@ -834,6 +834,7 @@ class HealthKitAggregator:
 
             elif time_behavior == "point":
                 dft = dft.copy()
+                dft["value"] = pd.to_numeric(dft["value"], errors="coerce")
                 dft["_src_row_id"] = np.arange(len(dft))
                 dft["point_ts_utc"] = pd.to_datetime(dft.get("utc_start"), utc=True).dt.tz_convert("UTC")
                 dft = self._assign_points_to_windows(dft, windows, ts_col="point_ts_utc")

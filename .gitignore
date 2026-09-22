@@ -17,3 +17,6 @@ tests/
 
 # Local macOS metadata
 .DS_Store
+
+# Experimental notebooks
+notebooks/
